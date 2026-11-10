@@ -5,6 +5,7 @@ import * as db from './store.js';
 import * as calls from './calls.js';
 import * as live from './live.js';
 import qrcode from 'qrcode-generator';
+import { DONATE_BTC, validBtcAddress, groupAddress } from './donate.js';
 import { analyzeUrl, analyzeMessage, analyzeFile, containsRecoveryKey, URL_RE } from '../shared/linksafety.js';
 import { cleanText, looksLikeImpersonation } from '../shared/policy.js';
 import { weakPin, PIN_RE } from '../shared/pin.js';
@@ -983,6 +984,7 @@ function settingsDialog() {
     <div class="field"><span>Avatar emoji (optional)</span><div class="row"><input id="sEmoji" maxlength="4" value="${esc(av.emoji || '')}" style="width:80px"/><button class="btn" id="sPickEmoji" data-pick-emoji type="button">Pick</button></div></div>
     <div class="field"><span>Avatar color</span><div class="colors">${AVATAR_COLORS.map((c) => `<button type="button" data-color="${c}" style="background:${c}" class="${c === av.color ? 'sel' : ''}"></button>`).join('')}</div></div>
     <div class="switch"><span>Your link: <code>${esc(myLink())}</code></span><button class="btn" id="sShare">Share</button></div>
+    <div class="switch"><span>🧡 Support QChat with a Bitcoin donation</span><button class="btn" id="sDonate">Donate</button></div>
     <div class="section-title">Privacy</div>
     <div class="switch"><span>Hide my online status &amp; last seen</span><input type="checkbox" id="sHide" ${me.hideLastSeen ? 'checked' : ''}/></div>
     <div class="switch"><span>Send read receipts (blue ticks)</span><input type="checkbox" id="sRead" ${A.settings.readReceipts ? 'checked' : ''}/></div>
@@ -1011,6 +1013,7 @@ function settingsDialog() {
     $('#sPickEmoji', card).onclick = () => pickEmoji((em) => { av.emoji = em; $('#sEmoji', card).value = em; refreshAv(); });
     $('#sBlocked', card).onclick = blockedDialog;
     $('#sShare', card).onclick = shareDialog;
+    $('#sDonate', card).onclick = donateDialog;
     $('#sPush', card).onchange = async (e) => { if (e.target.checked) { if (!(await enablePush())) e.target.checked = false; else toast('Push notifications on'); } else disablePush(); };
     $('#sPass', card).onclick = passcodeDialog;
     $('#sAutoLock', card) && ($('#sAutoLock', card).onchange = (e) => { A.settings.autoLock = Number(e.target.value); persist('settings'); db.setPlain('autoLock', A.settings.autoLock); });
@@ -1221,6 +1224,20 @@ function goLiveDialog() {
   });
 }
 
+// ======================= donate =======================
+function donateDialog() {
+  const addr = DONATE_BTC;
+  if (!validBtcAddress(addr)) return toast('Donations are unavailable right now');
+  openModal(`<h3>🧡 Support QChat</h3>
+    <p class="muted small">QChat has no ads and never sells data. If it's useful to you, a Bitcoin donation helps keep the servers running.</p>
+    <div class="qr">${qrSvg('bitcoin:' + addr)}</div>
+    <div class="donate-addr"><span class="muted small">Bitcoin (BTC) address</span><code id="dnAddr">${esc(groupAddress(addr))}</code></div>
+    <p class="donate-warn small">🛡️ This is the <b>only</b> QChat donation address, and it's built into the app. QChat will never message you asking for crypto — anyone in a chat who does is a scammer. Check the first and last characters in your wallet before sending, and only send Bitcoin (BTC) to it.</p>
+    <div class="modal-actions"><button class="btn" id="dnCopy">Copy address</button><a class="btn" id="dnWallet" href="bitcoin:${addr}">Open in wallet</a><button class="btn primary" data-close>Done</button></div>`, (card) => {
+    $('#dnCopy', card).onclick = () => navigator.clipboard?.writeText(addr).then(() => toast('Bitcoin address copied'), () => toast('Copy the address above'));
+  });
+}
+
 // ======================= share my link =======================
 const myLink = () => `${window.__QCHAT_PREVIEW ? 'https://your-qchat-domain' : location.origin}/@${ME()}`;
 function qrSvg(text) { const q = qrcode(0, 'M'); q.addData(text); q.make(); return q.createSvgTag({ cellSize: 6, margin: 3, scalable: true }); }
@@ -1395,6 +1412,8 @@ $('#camBtn').onclick = (e) => { const on = calls.toggle('video'); if (on !== nul
 // ======================= wiring =======================
 $('#newChatBtn').onclick = () => newChatDialog();
 $('#shareBtn').onclick = shareDialog;
+$('#donateBtn').onclick = donateDialog;
+for (const el of document.querySelectorAll('[data-donate]')) el.onclick = (e) => { e.preventDefault(); donateDialog(); };
 $('#welcomeShare').onclick = shareDialog;
 $('#newGroupBtn').onclick = newGroupDialog;
 $('#statusBtn').onclick = statusDialog;

@@ -35,3 +35,12 @@ test('dangerous attachments', () => {
   assert.equal(analyzeFile('site.html').level, 'caution');
 });
 test('url extraction', () => { assert.deepEqual(extractUrls('see https://a.com/x, and www.b.org.'), ['https://a.com/x', 'www.b.org']); });
+
+test('donation address: built in and checksum-verified (a swapped or mistyped address is refused)', async () => {
+  const { DONATE_BTC, validBtcAddress } = await import('../src/client/donate.js');
+  assert.ok(validBtcAddress(DONATE_BTC));
+  assert.ok(!validBtcAddress(DONATE_BTC.slice(0, -1) + (DONATE_BTC.endsWith('v') ? 'w' : 'v'))); // one character changed
+  assert.ok(!validBtcAddress(DONATE_BTC.toUpperCase().replace('BC1', 'bc1')));
+  assert.ok(!validBtcAddress('tb1qrdscfgplay3vstk3zhefn7fyhcxhxn2ssp4nzv')); // testnet
+  assert.ok(validBtcAddress('bc1p5d7rjq7g6rdk2yhzks9smlaqtedr4dekq08ge8ztwac72sfr9rusxg3297')); // Taproot (bech32m)
+});

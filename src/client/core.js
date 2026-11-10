@@ -454,7 +454,9 @@ export async function pinRecover(user, pin, onStep = () => {}) {
     await new Promise((res, rej) => { ws.onopen = res; ws.onerror = () => rej(new Error('Cannot reach the server')); });
     ws.send(JSON.stringify({ t: 'pin_params', user, rid: 1 }));
     const params = await next((m) => m.t === 'pin_params');
-    if (!params.enabled) throw err(params.error === 'rate_limited' ? 'Too many tries — wait a few minutes' : 'PIN login isn’t set up for this account (or was disabled after too many wrong PINs). Use your recovery key.');
+    if (!params.enabled) throw err(params.error === 'rate_limited' ? 'Too many tries — wait a few minutes'
+      : `No PIN login found for @${user}. Check the username is spelled exactly right. If you never set a PIN (or it was turned off after too many wrong tries), use your recovery key instead.`
+        + (globalThis.__QCHAT_PREVIEW ? ' (In this preview the server lives in this browser tab: accounts survive reloads but are gone once the tab is closed.)' : ''));
     if (params.lockedFor > 0) throw err(`Too many wrong PINs. Try again in ${Math.ceil(params.lockedFor / 60000)} min.`, params);
     onStep('Checking your PIN…');
     const salt = C.unb64(params.salt); const { auth, enc } = await pinKeys(pin, salt);

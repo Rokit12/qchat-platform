@@ -373,3 +373,9 @@ a.btn { text-decoration: none; display: inline-block; }
 .welcome .status-link { display: flex; justify-content: center; }
 @media (max-width: 800px) { .adm-shell { flex-direction: column; } .adm-nav { width: auto; height: auto; position: static; flex-direction: row; flex-wrap: wrap; } .adm-me { border: 0; padding: 0; } .adm-main { padding: 14px; } }
 #mpUser{resize:vertical;min-height:38px;max-height:160px;font:inherit}
+.donate-addr { display: grid; gap: 4px; text-align: center; margin: 10px 0; }
+.donate-addr code { font-size: 15px; letter-spacing: .5px; background: var(--bg); border: 1px dashed var(--accent); border-radius: 10px; padding: 10px; user-select: all; word-break: break-word; }
+.donate-warn { background: rgba(255,176,32,.08); border-left: 3px solid var(--accent); padding: 8px 10px; border-radius: 6px; line-height: 1.45; }
+a.btn { text-decoration: none; display: inline-block; }
+.donate-link { color: var(--accent); font-size: 13px; text-decoration: none; margin: 12px 0 0 14px; display: inline-block; }
+.donate-link:hover { text-decoration: underline; }
