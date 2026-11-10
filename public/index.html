@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0b141a" />
+  <title>QChat — post-quantum private messenger</title>
+  <link rel="icon" href="icon.svg" type="image/svg+xml" />
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- ============ ONBOARDING ============ -->
+  <section id="onboard" class="onboard hidden">
+    <div class="ob-card">
+      <div class="ob-logo"><img src="icon.svg" alt="" /><h1>QChat</h1></div>
+      <p class="ob-tag">Connect with anyone in the world using only a username.<br/>No phone number. No email. Post‑quantum end‑to‑end encryption.</p>
+      <div class="tabs">
+        <button class="tab active" data-tab="create">Create account</button>
+        <button class="tab" data-tab="restore">Log in with recovery key</button>
+      </div>
+      <form id="createForm" class="ob-form">
+        <label>Choose a username<input name="username" autocomplete="off" spellcheck="false" placeholder="e.g. amina.k" required /></label>
+        <label>Display name<input name="displayName" placeholder="What friends see" maxlength="40" /></label>
+        <button class="btn primary" type="submit">Generate quantum‑safe keys &amp; join</button>
+      </form>
+      <form id="restoreForm" class="ob-form hidden">
+        <label>Username<input name="username" autocomplete="off" spellcheck="false" required /></label>
+        <label>Recovery key<textarea name="key" rows="3" spellcheck="false" placeholder="Paste the recovery key you saved" required></textarea></label>
+        <button class="btn primary" type="submit">Log in</button>
+      </form>
+      <p id="obError" class="error"></p>
+      <div id="obKey" class="hidden">
+        <h3>Save your recovery key</h3>
+        <p class="muted">This key <b>is</b> your account. There is no password and no “forgot password”. Store it somewhere safe — you need it to add a device or restore a backup.</p>
+        <pre id="obKeyText" class="keybox"></pre>
+        <div class="row">
+          <button class="btn" id="obCopy" type="button">Copy</button>
+          <button class="btn" id="obDownload" type="button">Download</button>
+          <button class="btn primary" id="obContinue" type="button">I saved it — continue</button>
+        </div>
+      </div>
+      <p class="ob-foot">🔐 Post‑quantum double ratchet · ML‑KEM‑768 + ML‑DSA‑65 (NIST FIPS 203 / 204) · AES‑256‑GCM</p>
+    </div>
+  </section>
+
+  <!-- ============ LOCK SCREEN ============ -->
+  <section id="lockScreen" class="onboard hidden">
+    <form class="ob-card lock-card" id="lockForm">
+      <div class="ob-logo"><img src="icon.svg" alt="" /><h1>QChat is locked</h1></div>
+      <p class="muted">Your messages are encrypted on this device. Enter your passcode to unlock.</p>
+      <input type="password" id="lockInput" placeholder="Passcode" autocomplete="current-password" />
+      <p class="error" id="lockErr"></p>
+      <button class="btn primary" type="submit">Unlock</button>
+      <button class="link" type="button" id="lockForget">Forgot passcode?</button>
+    </form>
+  </section>
+
+  <!-- ============ MAIN APP ============ -->
+  <main id="app" class="app hidden">
+    <aside class="sidebar">
+      <header class="side-head">
+        <button class="avatar-btn" id="meAvatar" title="Profile & settings"></button>
+        <div class="grow"></div>
+        <button class="icon-btn hidden" id="lockBtn" title="Lock now">🔒</button>
+        <button class="icon-btn" id="shareBtn" title="Share my link">🔗</button>
+        <button class="icon-btn status-btn" id="statusBtn" title="Status &amp; live">⭕</button>
+        <button class="icon-btn" id="newChatBtn" title="New chat">💬</button>
+        <button class="icon-btn" id="newGroupBtn" title="New group">👥</button>
+        <button class="icon-btn" id="settingsBtn" title="Settings">⚙️</button>
+      </header>
+      <div class="conn-banner hidden" id="connBanner">Connecting…</div>
+      <div class="search"><input id="chatSearch" placeholder="Search chats or start one with @username" /></div>
+      <div class="filters">
+        <button class="chip active" data-filter="all">All</button>
+        <button class="chip" data-filter="unread">Unread</button>
+        <button class="chip" data-filter="groups">Groups</button>
+        <button class="chip" data-filter="archived">Archived</button>
+      </div>
+      <ul id="chatList" class="chat-list"></ul>
+      <div id="emptyList" class="empty-list hidden">No chats yet.<br/>Tap 💬 and enter a friend's username.</div>
+    </aside>
+
+    <section class="pane" id="pane">
+      <div id="welcome" class="welcome">
+        <img src="icon.svg" alt="" />
+        <h2>QChat</h2>
+        <p>Messages, calls and files are end‑to‑end encrypted with post‑quantum cryptography.<br/>Share your username so people can find you: <b id="welcomeUser"></b></p>
+        <button class="btn primary" id="welcomeShare">🔗 Share my link</button>
+      </div>
+
+      <div id="chatView" class="chat-view hidden">
+        <header class="chat-head">
+          <button class="icon-btn back" id="backBtn">←</button>
+          <div class="avatar" id="chatAvatar"></div>
+          <div class="chat-title" id="chatTitleBox">
+            <div class="name" id="chatName"></div>
+            <div class="sub" id="chatSub"></div>
+          </div>
+          <button class="icon-btn" id="searchInChatBtn" title="Search">🔍</button>
+          <button class="icon-btn" id="voiceCallBtn" title="Voice call">📞</button>
+          <button class="icon-btn" id="videoCallBtn" title="Video call">🎥</button>
+          <button class="icon-btn" id="chatInfoBtn" title="Info">ⓘ</button>
+        </header>
+        <div class="inchat-search hidden" id="inChatSearch"><input id="inChatSearchInput" placeholder="Search messages…" /><button class="icon-btn" id="inChatSearchClose">✕</button></div>
+        <div class="messages" id="messages"></div>
+        <div class="reply-bar hidden" id="replyBar"><div class="reply-preview" id="replyPreview"></div><button class="icon-btn" id="replyCancel">✕</button></div>
+        <div class="safety-bar hidden" id="strangerBar"><span id="strangerText"></span><div class="row"><button class="btn danger" id="strangerReport">Block &amp; report</button><button class="btn" id="strangerOk">I know them</button></div></div>
+        <div class="safety-bar key hidden" id="keyBar"><span id="keyText"></span><div class="row"><button class="btn primary" id="keyVerify">Verify</button><button class="btn" id="keyAccept">Accept</button></div></div>
+        <div class="blocked-bar hidden" id="blockedBar">You blocked this contact. <button class="link" id="unblockBtn">Unblock</button></div>
+        <footer class="composer" id="composer">
+          <button class="icon-btn" id="emojiBtn" title="Emoji">😊</button>
+          <button class="icon-btn" id="attachBtn" title="Attach">📎</button>
+          <input type="file" id="fileInput" multiple hidden />
+          <textarea id="msgInput" rows="1" placeholder="Type a message"></textarea>
+          <button class="icon-btn send" id="sendBtn" title="Send">🎤</button>
+        </footer>
+        <div class="recording hidden" id="recordingBar">
+          <span class="dot"></span><span id="recTime">0:00</span><div class="grow"></div>
+          <button class="btn" id="recCancel">Cancel</button><button class="btn primary" id="recSend">Send</button>
+        </div>
+        <div class="emoji-panel hidden" id="emojiPanel"></div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ============ MODALS / OVERLAYS ============ -->
+  <div id="modal" class="modal hidden"><div class="modal-card" id="modalCard"></div></div>
+  <div id="ctxMenu" class="ctx hidden"></div>
+  <div id="lightbox" class="lightbox hidden"></div>
+  <div id="toast" class="toast hidden"></div>
+
+  <div id="statusViewer" class="status-viewer hidden"></div>
+
+  <div id="liveView" class="live hidden">
+    <video id="liveVideo" autoplay playsinline></video>
+    <div class="live-shade"></div>
+    <div class="live-top">
+      <div class="live-host" id="liveHost"></div>
+      <span class="live-badge">LIVE</span><span class="live-pill">👁 <span id="liveViewers">0</span></span><span class="live-pill" id="liveTime">0:00</span>
+      <button class="icon-btn" id="liveClose" title="Leave / end">✕</button>
+    </div>
+    <div class="live-connecting">Connecting to live…</div>
+    <div class="live-comments" id="liveComments"></div>
+    <div class="live-hearts" id="liveHearts"></div>
+    <div class="live-host-ctrls"><button class="round" id="liveFlip" title="Flip camera">🔄</button><button class="round" id="liveMic" title="Mute">🎙️</button></div>
+    <form class="live-bar" id="liveForm"><input id="liveInput" maxlength="200" placeholder="Add a comment…" autocomplete="off"/><button type="submit" class="round sm" title="Send">➤</button><button type="button" class="round sm heart" id="liveHeart" title="Send a heart">❤️</button></form>
+    <div class="live-e2e">🔒 End-to-end encrypted · post-quantum</div>
+  </div>
+
+  <div id="callView" class="call hidden">
+    <div id="callGrid" class="call-grid"></div>
+    <video id="localVideo" autoplay playsinline muted></video>
+    <div class="call-info"><div class="avatar big" id="callAvatar"></div><div id="callName" class="call-name"></div><div id="callStatus" class="call-status"></div></div>
+    <div class="call-controls">
+      <button class="round" id="muteBtn" title="Mute">🎙️</button>
+      <button class="round" id="camBtn" title="Camera">📷</button>
+      <button class="round accept hidden" id="acceptBtn" title="Accept">📞</button>
+      <button class="round hang" id="hangBtn" title="Hang up">✖</button>
+    </div>
+  </div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

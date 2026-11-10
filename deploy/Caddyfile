@@ -1,0 +1,39 @@
+{
+	email {$ADMIN_EMAIL}
+	servers {
+		protocols h1 h2 h3
+		timeouts {
+			read_header 10s
+			idle 2m
+		}
+	}
+}
+
+{$DOMAIN} {
+	tls {
+		protocols tls1.2 tls1.3
+	}
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy no-referrer
+		-Server
+		-Via
+	}
+	# requests larger than the app ever needs are dropped at the edge
+	request_body {
+		max_size 25MB
+	}
+	reverse_proxy qchat1:3000 qchat2:3000 {
+		lb_policy least_conn
+		health_uri /health
+		health_interval 10s
+		header_up X-Forwarded-For {remote_host}
+	}
+}
+
+http://{$DOMAIN} {
+	redir https://{host}{uri} permanent
+}

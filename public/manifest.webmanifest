@@ -1,0 +1,10 @@
+{
+  "name": "QChat",
+  "short_name": "QChat",
+  "description": "Username-only messenger with post-quantum end-to-end encryption",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0b141a",
+  "theme_color": "#0b141a",
+  "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml" }]
+}

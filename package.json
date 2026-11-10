@@ -1,0 +1,28 @@
+{
+  "name": "qchat",
+  "version": "2.0.0",
+  "description": "Username-only, post-quantum end-to-end encrypted messenger",
+  "main": "server/index.js",
+  "scripts": {
+    "build": "node build.mjs",
+    "prestart": "node build.mjs",
+    "start": "node --disable-warning=ExperimentalWarning server/index.js",
+    "test": "node --test --test-timeout=120000 tests/crypto.test.mjs tests/linksafety.test.mjs tests/server.test.mjs tests/security.test.mjs",
+    "audit": "npm audit --omit=dev"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@noble/hashes": "^2.4.0",
+    "@noble/post-quantum": "^0.7.1",
+    "esbuild": "^0.28.2",
+    "pg": "^8.23.1",
+    "qrcode-generator": "^2.0.4",
+    "redis": "^6.3.1",
+    "web-push": "^4.0.0",
+    "ws": "^8.22.2"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=22.5"
+  }
+}
