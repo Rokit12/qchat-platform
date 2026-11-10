@@ -5,7 +5,7 @@ const r = await build({ entryPoints: ['src/preview/main.js'], bundle: true, mini
 let js = r.outputFiles[0].text.replace(/<\/script/gi, '<\\/script').replace(/['"]icon\.svg['"]/g, JSON.stringify(''));
 const icon = 'data:image/svg+xml;base64,' + fs.readFileSync('public/icon.svg').toString('base64');
 const css = fs.readFileSync('public/style.css', 'utf8') + `
-.preview-pill { position: fixed; left: 12px; bottom: 12px; z-index: 40; background: rgba(32,44,51,.96); border: 1px solid var(--accent); color: var(--muted); font-size: 12px; line-height: 1.4; padding: 6px 12px; border-radius: 12px; max-width: 356px; pointer-events: none; }
+.preview-pill { position: fixed; left: 12px; bottom: 12px; z-index: 40; background: rgba(34,26,54,.96); border: 1px solid var(--accent); color: var(--muted); font-size: 12px; line-height: 1.4; padding: 6px 12px; border-radius: 12px; max-width: 356px; pointer-events: none; }
 .preview-pill b { color: var(--accent); }
 @media (max-width: 760px) { .preview-pill { right: 12px; max-width: none; font-size: 11px; } .app.in-chat ~ .preview-pill { display: none; } }`;
 let html = fs.readFileSync('public/index.html', 'utf8')

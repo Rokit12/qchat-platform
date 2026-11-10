@@ -4,7 +4,7 @@ A WhatsApp‑style messenger where people find each other **only by username**. 
 
 ## Features
 
-- **Messaging:** 1:1 and group chats, replies, reactions, edit, delete for everyone, forward, in‑chat search, disappearing messages, ticks (sent / delivered / read), typing and "recording audio" indicators, online / last seen.
+- **Messaging:** 1:1 chats and **groups of up to 3,500 members** (sender keys: each message is encrypted once and stays the same size however big the group is; add members by pasting a list of usernames), replies, reactions, edit, delete for everyone, forward, in‑chat search, disappearing messages, ticks (sent / delivered / read), typing and "recording audio" indicators, online / last seen.
 - **Media:** photos, videos, files up to 10 MB, voice notes, drag‑and‑drop and paste.
 - **Calls:** 1:1 and **group** voice/video calls with up to 8 people. Every audio/video frame is encrypted with keys exchanged over the PQ ratchet.
 - **Status:** 24‑hour text or photo stories, shared with your contacts, with view receipts and replies.
@@ -83,6 +83,7 @@ PORT=3100 npm start & python3 tests/e2e.py       # full browser test (Playwright
 ```
 
 - **`tests/crypto.test.mjs`:** the protocol's adversarial suite. It covers forward secrecy, post‑compromise security, replay, tampering, forged prekeys, one‑time‑prekey reuse, device‑certificate forgery, device‑list rollback, group fan‑out and safety numbers.
+- **`tests/senderkey.test.mjs` / `tests/biggroup.test.mjs`:** sender keys (forgery by another member, replay, rotation after removal) and a real 3,500‑member group through the server: one ~4.6 KB message reaches ~7,000 device queues in about 0.25 s (SQLite) / 1.3 s (Postgres), plus the per‑account delivery quota.
 - **`tests/server.test.mjs`:** the real server process, single‑instance and two‑instance (Postgres + Redis). It covers multi‑device delivery, the offline queue, cross‑instance presence, device revocation, rollback rejection, and Web Push to a fake push service. The test decrypts the push to prove it's content‑free.
 - **`tests/e2e.py`:** 3 users and 4 browsers. It covers DMs, groups, media, edits and deletes, linking a second device with history copy, Status, a 1:1 video call ringing on both devices (with frame‑encryption counters checked), a 3‑way group video call with key rotation, encrypted backup round‑trip, passcode lock, a check that the local database is ciphertext only, offline delivery, and device revocation.
 

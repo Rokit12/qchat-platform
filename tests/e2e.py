@@ -42,7 +42,7 @@ async def send(p, t):
     await p.fill("#msgInput", t); await p.press("#msgInput", "Enter")
 
 async def chat(p, name):
-    await p.click(f".chat-item:has-text('{name}')")
+    await p.click(f".chat-item:has(.ci-name:has-text('{name}'))")
 
 def ok(msg): print("✔", msg, flush=True)
 
@@ -101,7 +101,25 @@ async def main():
         await a2.wait_for_selector(".chat-item:has-text('World Friends')", timeout=15000)
         await a.wait_for_selector(".msg.out:has-text('Welcome to the group') .ticks.read", timeout=15000); ok("group chat across 4 devices + group read receipts")
 
-        # ---- status ----
+        # ---- big-group machinery: sender keys, removal → key rotation, bulk paste ----
+        gk = await a.evaluate("window.__qchat.groupKeys()"); assert len(gk["sending"]) == 1 and list(gk["sending"].values())[0]["n"] >= 1, gk
+        assert (await bb.evaluate("window.__qchat.groupKeys()"))["receiving"] >= 2  # alice's + carol's chains
+        ok(f"group messages use sender keys (one ciphertext for everyone): {gk}")
+        kid0 = list(gk["sending"].values())[0]["kid"]
+        await chat(a, "World Friends"); await a.click("#chatTitleBox"); await a.click("[data-kick=carol]"); await a.click("#cfYes")
+        await a.wait_for_selector("#giSave"); await a.click("#giSave")
+        await c.wait_for_selector(".sys:has-text('removed You')", timeout=15000); await bb.wait_for_selector(".sys:has-text('removed Carol')", timeout=15000)
+        await send(a, "secret after carol left"); await bb.wait_for_selector("text=secret after carol left", timeout=15000)
+        await asyncio.sleep(2); assert await c.locator("text=secret after carol left").count() == 0
+        kid1 = list((await a.evaluate("window.__qchat.groupKeys()"))["sending"].values())[0]["kid"]; assert kid1 != kid0
+        ok("removed member: sender key rotated, she can't read new group messages")
+        await a.click("#chatTitleBox"); await a.fill("#mpUser", "carol, nosuchuser42\nalso_missing9"); await a.click("#mpAdd")
+        await a.wait_for_selector("#mpErr:has-text('2 usernames not found')"); await a.wait_for_selector("#mpList >> text=@carol")
+        await a.click("#giSave"); await send(a, "welcome back carol")
+        await c.wait_for_selector("text=welcome back carol", timeout=20000)
+        assert await c.locator("text=secret after carol left").count() == 0
+        ok("bulk-paste add (unknown names reported); re-added member reads new messages but not the ones sent while she was out")
+
         await bb.click("#statusBtn"); await bb.click("#stText"); await bb.fill("#stInput", "Quantum-safe hello 🌍"); await bb.click("#stPost")
         await a.wait_for_selector("#statusBtn.has-new", timeout=15000)
         await a.click("#statusBtn"); await a.click("[data-st=bob]"); await a.wait_for_selector(".sv-text:has-text('Quantum-safe hello')")

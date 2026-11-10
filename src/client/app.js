@@ -21,6 +21,10 @@ const msgIndex = new Map();
 const TTL_OPTIONS = [[0, 'Off'], [86400, '24 hours'], [604800, '7 days'], [7776000, '90 days']];
 const ttlLabel = (s) => (TTL_OPTIONS.find((x) => x[0] === s) || [0, `${s}s`])[1];
 const STATUS_TTL = 864e5;
+const GROUP_MAX = 3500;   // members per group
+const BIG_GROUP = 256;    // above this: no per-member receipts/typing, not used as a status audience
+const CALL_MAX = 8;       // group calls are a direct mesh (see calls.js MAX_PARTICIPANTS)
+const isBig = (chat) => chat?.type === 'group' && chat.members.length > BIG_GROUP;
 
 // ======================= persistence =======================
 const dirty = new Set(); let saveT;
@@ -81,6 +85,8 @@ function wipeMsg(m) { m.deleted = true; m.text = ''; m.reactions = {}; if (m.med
 
 async function sendEvent(chat, payload, opts = {}) {
   if (chat.type === 'group') payload.g = chat.gid; else payload.to = chat.peer;
+  // group-wide events use sender keys: encrypted once, the same size for 3 or 3,500 members
+  if (chat.type === 'group' && !opts.users && !opts.devices) return chat.left ? false : core.groupSend(chat.gid, chatRecipients(chat), payload, opts);
   return core.sendPayload(opts.users || chatRecipients(chat), payload, opts);
 }
 async function msgPayload(m) {
@@ -105,6 +111,7 @@ async function sendMessage(chat, { kind = 'text', text = '', media = null, reply
 // ======================= receiving =======================
 const pendingGroup = {};
 hooks.isBlocked = (u) => A.blocked.has(u);
+hooks.isGroupMember = (g, u) => { const c = A.chats['g:' + g]; return !!c && !c.left && c.members.includes(u); };
 hooks.onPayload = async (from, fd, ts, envId, p) => {
   const fromMe = from === ME();
   if (typeof p.type === 'string' && p.type.startsWith('live_')) return live.onSignal(from, fd, ts, p);
@@ -137,7 +144,7 @@ hooks.onPayload = async (from, fd, ts, envId, p) => {
       if (m.ttl) m.expireAt = m.ts + m.ttl * 1000;
       addMessage(chat, m);
       if (!fromMe) {
-        queueReceipt(chat, from, m.id, 'delivered');
+        if (!isBig(chat)) queueReceipt(chat, from, m.id, 'delivered');
         if (isViewing(chat)) markRead(chat); else { chat.unread = (chat.unread || 0) + 1; persist('chats'); notify(chat, m); }
         if (A.typing[chat.id]) { clearTimeout(A.typing[chat.id][from]?.timer); delete A.typing[chat.id][from]; }
       }
@@ -178,8 +185,9 @@ hooks.onPayload = async (from, fd, ts, envId, p) => {
     }
     case 'leave': {
       if (chat.type !== 'group') break;
+      if (!chat.members.includes(from)) break;
       chat.members = chat.members.filter((u) => u !== from); chat.admins = chat.admins.filter((u) => u !== from);
-      if (fromMe) chat.left = true;
+      if (fromMe) chat.left = true; else core.groupRotate(chat.gid); // the leaver can't read anything sent after this
       persist('chats'); addSys(chat, `${fromMe ? 'You' : displayName(from)} left`);
       if (A.current === chat.id) openChat(chat.id);
       break;
@@ -189,7 +197,7 @@ hooks.onPayload = async (from, fd, ts, envId, p) => {
 
 async function onGroupMeta(from, ts, p) {
   const cid = 'g:' + p.g; let chat = A.chats[cid];
-  const members = [...new Set((p.members || []).map(String))].slice(0, 256);
+  const members = [...new Set((p.members || []).map(String))].slice(0, GROUP_MAX);
   const admins = (p.admins || []).filter((u) => members.includes(u));
   const by = from === ME() ? 'You' : displayName(from);
   if (!chat) {
@@ -203,13 +211,15 @@ async function onGroupMeta(from, ts, p) {
     if (!chat.admins.includes(from)) return;
     const added = members.filter((u) => !chat.members.includes(u)), removed = chat.members.filter((u) => !members.includes(u));
     if (p.name && p.name !== chat.name) addSys(chat, `${by} changed the group name to “${clip(p.name, 60)}”`);
-    for (const u of added) addSys(chat, `${by} added ${displayName(u)}`);
-    for (const u of removed) addSys(chat, `${by} removed ${displayName(u)}`);
+    if (added.length > 20) addSys(chat, `${by} added ${added.length} people`); else for (const u of added) addSys(chat, `${by} added ${displayName(u)}`);
+    if (removed.length > 20) addSys(chat, `${by} removed ${removed.length} people`); else for (const u of removed) addSys(chat, `${by} removed ${displayName(u)}`);
+    if (removed.length) core.groupRotate(p.g); // new chain: removed people can't read what comes next
+    if (added.length) core.groupMembersAdded(p.g); // new people only get messages from now on
     Object.assign(chat, { name: clip(p.name, 60) || chat.name, desc: clip(p.desc, 500), members, admins });
     chat.left = !members.includes(ME());
   }
   persist('chats'); renderChatList(); if (A.current === cid) openChat(cid);
-  for (const u of members) if (u !== ME() && !K.contacts[u]) core.refreshUser(u);
+  core.prefetch(members.filter((u) => u !== ME())); // names + keys, 500 per request
   const q = pendingGroup[p.g]; delete pendingGroup[p.g];
   if (q) for (const args of q) await hooks.onPayload(...args);
 }
@@ -245,6 +255,8 @@ function flushReceipts() {
   for (const [k, r] of Object.entries(rcpt)) {
     delete rcpt[k];
     const ids = [...r.ids];
+    if (r.kind === 'delivered' && isBig(r.chat)) continue;
+    if (r.kind === 'read' && isBig(r.chat)) { sendEvent(r.chat, { type: 'receipt', kind: 'read', ids }, { users: [] }); continue; } // only sync my devices
     if (r.kind === 'delivered') sendEvent(r.chat, { type: 'receipt', kind: 'delivered', ids }, { users: [r.to], self: false });
     else sendEvent(r.chat, { type: 'receipt', kind: 'read', ids }, { users: A.settings.readReceipts ? [r.to] : [] }); // always sync read state to my devices
   }
@@ -264,7 +276,7 @@ document.addEventListener('visibilitychange', () => { const c = A.chats[A.curren
 let typingSentAt = 0, typingOffT;
 function sendTyping(on, kind = 'text') {
   const chat = A.chats[A.current]; if (!chat) return;
-  const to = chatRecipients(chat); if (!to.length) return;
+  const to = chatRecipients(chat); if (!to.length || isBig(chat)) return;
   core.wsSend({ t: 'typing', to, chat: chat.type === 'group' ? chat.id : '', on, kind });
 }
 function onComposerInput() {
@@ -467,7 +479,7 @@ function refreshHeader() {
   if (typing) sub.textContent = typing;
   else if (chat.type === 'dm') sub.textContent = A.blocked.has(chat.peer) ? 'blocked' : (fmtLastSeen(A.presence[chat.peer]) || '@' + chat.peer);
   else sub.textContent = chat.left ? "You're not a member" : chat.members.map(displayName).join(', ');
-  const canCall = !(chat.type === 'group' && chat.left) && !(chat.type === 'dm' && A.blocked.has(chat.peer));
+  const canCall = !(chat.type === 'group' && (chat.left || chat.members.length > CALL_MAX)) && !(chat.type === 'dm' && A.blocked.has(chat.peer));
   $('#voiceCallBtn').classList.toggle('hidden', !canCall); $('#videoCallBtn').classList.toggle('hidden', !canCall);
 }
 const fmt = (h) => h.replace(/(^|\s)\*([^*\n]+)\*(?=\s|$)/g, '$1<b>$2</b>').replace(/(^|\s)_([^_\n]+)_(?=\s|$)/g, '$1<i>$2</i>').replace(/(^|\s)~([^~\n]+)~(?=\s|$)/g, '$1<s>$2</s>');
@@ -761,20 +773,36 @@ function newChatDialog(prefill = '') {
     if (prefill) go();
   });
 }
-function memberPicker(card, list) {
-  const render = () => { $('#mpList', card).innerHTML = list.map((u) => `<li>${avatarHTML(u, 'sm')}<div class="grow"><b>${esc(displayName(u))}</b><small>@${esc(u)}</small></div><button class="icon-btn" data-rm="${esc(u)}">✕</button></li>`).join(''); };
+function memberPicker(card, list, max = GROUP_MAX - 1) {
+  const SHOW = 200;
+  const render = () => {
+    $('#mpList', card).innerHTML = list.slice(-SHOW).reverse().map((u) => `<li>${avatarHTML(u, 'sm')}<div class="grow"><b>${esc(displayName(u))}</b><small>@${esc(u)}</small></div><button class="icon-btn" data-rm="${esc(u)}">✕</button></li>`).join('')
+      + (list.length > SHOW ? `<li class="muted small">…and ${list.length - SHOW} more</li>` : '');
+    $('#mpCount', card).textContent = list.length ? `${list.length} selected` : '';
+  };
   const add = async () => {
-    const inp = $('#mpUser', card); const u = inp.value.trim().toLowerCase().replace(/^@/, ''); $('#mpErr', card).textContent = '';
-    if (!u || u === ME() || list.includes(u)) return (inp.value = '');
-    const p = await core.refreshUser(u); if (!p) return ($('#mpErr', card).textContent = `@${u} not found`);
-    list.push(u); inp.value = ''; render();
+    const inp = $('#mpUser', card); $('#mpErr', card).textContent = '';
+    // one username, or many pasted at once (commas, spaces or new lines)
+    const names = [...new Set(inp.value.toLowerCase().split(/[\s,;]+/).map((x) => x.replace(/^@/, '')).filter(Boolean))].filter((u) => u !== ME() && !list.includes(u));
+    if (!names.length) return (inp.value = '');
+    const bad = names.filter((u) => !/^[a-z0-9_.]{3,24}$/.test(u));
+    let ok = names.filter((u) => !bad.includes(u));
+    if (list.length + ok.length > max) { $('#mpErr', card).textContent = `A group can have up to ${GROUP_MAX.toLocaleString()} members.`; ok = ok.slice(0, Math.max(0, max - list.length)); }
+    $('#mpAdd', card).disabled = true; $('#mpAdd', card).textContent = ok.length > 1 ? 'Checking…' : 'Add';
+    try {
+      if (ok.length === 1) { const p = await core.refreshUser(ok[0]); if (p === undefined) { $('#mpErr', card).textContent = 'Network problem — try again.'; return; } if (!p) ok = []; }
+      else await core.prefetch(ok);
+    } finally { $('#mpAdd', card).disabled = false; $('#mpAdd', card).textContent = 'Add'; }
+    const found = ok.filter((u) => K.contacts[u]?.aik), missing = names.filter((u) => !found.includes(u));
+    list.push(...found); inp.value = missing.join(', '); render();
+    if (missing.length && !$('#mpErr', card).textContent) $('#mpErr', card).textContent = missing.length === 1 ? `@${missing[0]} not found` : `${missing.length} usernames not found (left in the box)`;
   };
   $('#mpAdd', card).onclick = add;
-  $('#mpUser', card).addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); add(); } });
+  $('#mpUser', card).addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); add(); } });
   $('#mpList', card).onclick = (e) => { const b = e.target.closest('[data-rm]'); if (b) { list.splice(list.indexOf(b.dataset.rm), 1); render(); } };
   render();
 }
-const pickerHTML = (label = 'Add members by username') => `<div class="field"><span>${label}</span><div class="row"><input id="mpUser" class="grow" placeholder="@username" autocomplete="off" spellcheck="false"/><button class="btn" id="mpAdd" type="button">Add</button></div></div><p class="error" id="mpErr"></p><ul class="list" id="mpList"></ul>`;
+const pickerHTML = (label = 'Add members by username') => `<div class="field"><span>${label} <small class="muted">— paste many at once, separated by commas or new lines (up to ${GROUP_MAX.toLocaleString()})</small></span><div class="row"><textarea id="mpUser" class="grow" rows="1" placeholder="@username" autocomplete="off" spellcheck="false"></textarea><button class="btn" id="mpAdd" type="button">Add</button></div></div><p class="error" id="mpErr"></p><div class="muted small" id="mpCount"></div><ul class="list" id="mpList"></ul>`;
 function newGroupDialog() {
   const members = [];
   openModal(`<h3>New group</h3><div class="field"><span>Group name</span><input id="ngName" maxlength="60" placeholder="e.g. Family 🌍"/></div>${pickerHTML()}
@@ -788,13 +816,20 @@ function newGroupDialog() {
       const chat = A.chats[cid] = { id: cid, type: 'group', gid, name, desc: '', members: [ME(), ...members], admins: [ME()], ttl: 0, unread: 0, lastTs: Date.now(), createdAt: Date.now() };
       A.msgs[cid] = []; addSys(chat, `You created group “${name}”`); addSys(chat, '🔒 Group messages are end-to-end encrypted with a post-quantum double ratchet.', 'e2e');
       closeModal(); renderChatList(); openChat(cid);
-      await pushGroupMeta(chat);
+      await pushGroupMeta(chat, [], members);
     };
   });
 }
-function pushGroupMeta(chat, extraTo = []) {
-  const users = [...new Set([...chat.members, ...extraTo])].filter((u) => u !== ME());
-  return sendEvent(chat, { type: 'group', name: chat.name, desc: chat.desc, members: chat.members, admins: chat.admins, ttl: chat.ttl }, { users });
+async function pushGroupMeta(chat, extraTo = [], added = []) {
+  const meta = { type: 'group', name: chat.name, desc: chat.desc, members: chat.members, admins: chat.admins, ttl: chat.ttl };
+  if (chat.members.length <= BIG_GROUP) {
+    const users = [...new Set([...chat.members, ...extraTo])].filter((u) => u !== ME());
+    return sendEvent(chat, meta, { users });
+  }
+  // big group: people who were just added/removed get it pairwise (they don't share the group key); everyone else via the group key
+  const direct = [...new Set([...extraTo, ...added])].filter((u) => u !== ME());
+  if (direct.length) await sendEvent(chat, { ...meta }, { users: direct, self: false });
+  return sendEvent(chat, { ...meta });
 }
 const ttlSelect = (cur) => `<select id="ttlSel">${TTL_OPTIONS.map(([v, l]) => `<option value="${v}" ${v === (cur || 0) ? 'selected' : ''}>${l}</option>`).join('')}</select>`;
 function setTtl(chat, ttl) {
@@ -863,15 +898,21 @@ function toggleBlock(u) {
 function clearChat(chat) { for (const m of A.msgs[chat.id] || []) { if (m.media) delMedia(m.media.id); msgIndex.delete(m.id); } A.msgs[chat.id] = []; persist('msgs:' + chat.id); scheduleRender(false); renderChatList(); }
 function deleteChat(chat) { clearChat(chat); delete A.chats[chat.id]; delete A.msgs[chat.id]; persist('chats'); persist('msgs:' + chat.id); if (A.current === chat.id) closeChat(); renderChatList(); }
 
+function memberRows(chat, amAdmin, q) {
+  const SHOW = 200; q = q.toLowerCase().replace(/^@/, '');
+  const list = (q ? chat.members.filter((u) => u.includes(q) || displayName(u).toLowerCase().includes(q)) : [...chat.admins.filter((u) => chat.members.includes(u)), ...chat.members.filter((u) => !chat.admins.includes(u))]);
+  return list.slice(0, SHOW).map((u) => `<li>${avatarHTML(u, 'sm')}<div class="grow"><b>${esc(displayName(u))}</b><small>@${esc(u)}</small></div>${chat.admins.includes(u) ? '<span class="tag">admin</span>' : ''}
+      ${amAdmin && u !== ME() ? `<button class="icon-btn" title="${chat.admins.includes(u) ? 'Dismiss admin' : 'Make admin'}" data-admin="${esc(u)}">⭐</button><button class="icon-btn" title="Remove" data-kick="${esc(u)}">✕</button>` : ''}
+      ${u !== ME() ? `<button class="icon-btn" title="Message" data-dm="${esc(u)}">💬</button>` : ''}</li>`).join('') + (list.length > SHOW ? `<li class="muted small">…and ${(list.length - SHOW).toLocaleString()} more — search to find someone</li>` : '');
+}
 function groupInfo(chat) {
   const amAdmin = chat.admins.includes(ME()) && !chat.left;
   openModal(`<div class="profile-head">${avatarHTML(chat, 'big')}
     ${amAdmin ? `<div class="field"><input id="giName" value="${esc(chat.name)}" maxlength="60"/></div><div class="field"><textarea id="giDesc" rows="2" placeholder="Group description">${esc(chat.desc || '')}</textarea></div>` : `<h3 style="margin:0">${esc(chat.name)}</h3><p class="muted">${esc(chat.desc || '')}</p>`}
-    <div class="muted">Group · ${chat.members.length} members</div></div>
+    <div class="muted">Group · ${chat.members.length.toLocaleString()} of ${GROUP_MAX.toLocaleString()} members</div></div>
     <div class="section-title">Members</div>
-    <ul class="list">${chat.members.map((u) => `<li>${avatarHTML(u, 'sm')}<div class="grow"><b>${esc(displayName(u))}</b><small>@${esc(u)}</small></div>${chat.admins.includes(u) ? '<span class="tag">admin</span>' : ''}
-      ${amAdmin && u !== ME() ? `<button class="icon-btn" title="${chat.admins.includes(u) ? 'Dismiss admin' : 'Make admin'}" data-admin="${esc(u)}">⭐</button><button class="icon-btn" title="Remove" data-kick="${esc(u)}">✕</button>` : ''}
-      ${u !== ME() ? `<button class="icon-btn" title="Message" data-dm="${esc(u)}">💬</button>` : ''}</li>`).join('')}</ul>
+    ${chat.members.length > 30 ? `<div class="field"><input id="giFind" placeholder="Search ${chat.members.length.toLocaleString()} members" autocomplete="off" spellcheck="false"/></div>` : ''}
+    <ul class="list" id="giMembers">${memberRows(chat, amAdmin, '')}</ul>
     ${amAdmin ? pickerHTML('Add more members') : ''}
     <div class="section-title">Settings</div>
     <div class="switch"><span>Disappearing messages</span>${ttlSelect(chat.ttl)}</div>
@@ -880,21 +921,25 @@ function groupInfo(chat) {
     <div class="modal-actions">${chat.left ? '<button class="btn danger" id="giDelete">Delete group</button>' : '<button class="btn danger" id="giLeave">Exit group</button>'}
       ${amAdmin ? '<button class="btn primary" id="giSave">Save</button>' : '<button class="btn primary" data-close>Done</button>'}</div>`, (card) => {
     const pendingAdd = [];
-    if (amAdmin) memberPicker(card, pendingAdd);
+    if ($('#giFind', card)) $('#giFind', card).oninput = (e) => { $('#giMembers', card).innerHTML = memberRows(chat, amAdmin, e.target.value.trim()); };
+    if (amAdmin) memberPicker(card, pendingAdd, GROUP_MAX - chat.members.length);
     $('#ttlSel', card).onchange = (e) => setTtl(chat, Number(e.target.value));
     chatToggles(chat, card, 'gi');
     card.addEventListener('click', async (e) => {
       const b = e.target.closest('button'); if (!b) return;
       if (b.dataset.dm) { closeModal(); const c = createDm(b.dataset.dm); renderChatList(); openChat(c.id); }
-      if (b.dataset.kick) { const u = b.dataset.kick; if (!(await confirmDialog('Remove member?', `Remove ${displayName(u)} from “${chat.name}”?`, 'Remove', true))) return groupInfo(chat); chat.members = chat.members.filter((x) => x !== u); chat.admins = chat.admins.filter((x) => x !== u); persist('chats'); addSys(chat, `You removed ${displayName(u)}`); await pushGroupMeta(chat, [u]); groupInfo(chat); }
+      if (b.dataset.kick) { const u = b.dataset.kick; if (!(await confirmDialog('Remove member?', `Remove ${displayName(u)} from “${chat.name}”?`, 'Remove', true))) return groupInfo(chat); chat.members = chat.members.filter((x) => x !== u); chat.admins = chat.admins.filter((x) => x !== u); persist('chats'); addSys(chat, `You removed ${displayName(u)}`); await core.groupRotate(chat.gid); await pushGroupMeta(chat, [u]); groupInfo(chat); }
       if (b.dataset.admin) { const u = b.dataset.admin; chat.admins = chat.admins.includes(u) ? chat.admins.filter((x) => x !== u) : [...chat.admins, u]; persist('chats'); await pushGroupMeta(chat); groupInfo(chat); }
     });
     $('#giSave', card) && ($('#giSave', card).onclick = async () => {
       const name = $('#giName', card).value.trim() || chat.name, desc = $('#giDesc', card).value.trim();
       if (name !== chat.name) addSys(chat, `You changed the group name to “${name}”`);
-      for (const u of pendingAdd) if (!chat.members.includes(u)) { chat.members.push(u); addSys(chat, `You added ${displayName(u)}`); }
+      const added = pendingAdd.filter((u) => !chat.members.includes(u)).slice(0, GROUP_MAX - chat.members.length);
+      chat.members.push(...added);
+      if (added.length > 20) addSys(chat, `You added ${added.length} people`); else for (const u of added) addSys(chat, `You added ${displayName(u)}`);
       Object.assign(chat, { name, desc }); persist('chats'); refreshHeader(); renderChatList(); closeModal();
-      await pushGroupMeta(chat);
+      if (added.length) await core.groupMembersAdded(chat.gid);
+      await pushGroupMeta(chat, [], added);
     });
     $('#giLeave', card) && ($('#giLeave', card).onclick = async () => {
       if (!(await confirmDialog('Exit group?', `You'll stop receiving messages from “${chat.name}”.`, 'Exit', true))) return;
@@ -1108,10 +1153,10 @@ async function importBackup(file) {
 }
 
 // ======================= status (24-hour stories) =======================
-const STATUS_BGS = ['#00a884', '#3a86ff', '#8e7dbe', '#ef476f', '#ff8800', '#264653', '#e76f51'];
+const STATUS_BGS = ['#5b2bb5', '#3a86ff', '#8e7dbe', '#ef476f', '#ff8800', '#264653', '#e76f51'];
 const statusAudience = () => { // people you chat with directly or share a group with
   const s = new Set();
-  for (const c of Object.values(A.chats)) { if (c.type === 'dm') s.add(c.peer); else if (!c.left) c.members.forEach((u) => s.add(u)); }
+  for (const c of Object.values(A.chats)) { if (c.type === 'dm') s.add(c.peer); else if (!c.left && !isBig(c)) c.members.forEach((u) => s.add(u)); }
   s.delete(ME()); for (const u of A.blocked) s.delete(u); return [...s];
 };
 async function postStatus(s) {
@@ -1562,7 +1607,7 @@ try { navigator.serviceWorker?.addEventListener('message', (e) => { if (e.data?.
 window.addEventListener('beforeunload', () => { flushPersist(); });
 
 (async () => {
-  if (!globalThis.crypto?.subtle || !window.indexedDB) { document.body.innerHTML = '<p style="padding:30px">QChat needs a modern browser served over HTTPS (or localhost).</p>'; return; }
+  if (!globalThis.crypto?.subtle) { document.body.innerHTML = '<p style="padding:30px">QChat needs a modern browser served over HTTPS (or localhost).</p>'; return; }
   if (!window.__QCHAT_PREVIEW) try { navigator.serviceWorker?.register('/sw.js').catch((e) => console.warn('sw', e)); } catch {}
   await db.openDb();
   const state = await db.keyState();
@@ -1571,4 +1616,5 @@ window.addEventListener('beforeunload', () => { flushPersist(); });
   await startApp();
 })();
 // Diagnostics (used by the automated tests; harmless in production)
-window.__qchat = { liveStats: live.liveStats, frameStats: calls.frameStats, callInfo: calls.callInfo, sessions: () => Object.keys(K.sessions).length };
+window.__qchat = { liveStats: live.liveStats, frameStats: calls.frameStats, callInfo: calls.callInfo, sessions: () => Object.keys(K.sessions).length,
+  groupKeys: () => ({ sending: Object.fromEntries(Object.entries(K.gsk).map(([g, st]) => [g, { kid: st.kid, n: st.n }])), receiving: Object.keys(K.gskr).length }) };

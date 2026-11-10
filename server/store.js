@@ -27,6 +27,7 @@ const rowDev = (r) => ({ device: r.device, cert: JSON.parse(r.cert), spk: JSON.p
 function api(db) {
   return {
     kind: db.kind,
+    raw: (sql) => db.run(sql), // tests only
     async getUser(u) { return rowUser((await db.q('SELECT * FROM users WHERE username=$1', [u]))[0]); },
     async createUser(u, aik, deviceList, profile) {
       await db.run('INSERT INTO users (username, aik, device_list, profile, created_at) VALUES ($1,$2,$3,$4,$5)', [u, aik, JSON.stringify(deviceList), JSON.stringify(profile), Date.now()]);
@@ -45,6 +46,15 @@ function api(db) {
       await db.tx(async (t) => { for (const tb of ['otpks', 'devices', 'queue', 'users', 'pin_recovery']) await t.run(`DELETE FROM ${tb} WHERE username=$1`, [u]); await t.run('DELETE FROM reports WHERE reporter=$1 OR target=$1', [u]); });
     },
     async getDevices(u) { return (await db.q('SELECT * FROM devices WHERE username=$1 ORDER BY created_at', [u])).map(rowDev); },
+    async getDevicesMany(users) { // bulk lookup for large-group fan-out (chunked IN so it stays fast at 3,500+ members)
+      const out = new Map(users.map((u) => [u, []]));
+      for (let i = 0; i < users.length; i += 500) {
+        const c = users.slice(i, i + 500);
+        const rows = await db.q(`SELECT * FROM devices WHERE username IN (${c.map((_, j) => '$' + (j + 1)).join(',')}) ORDER BY created_at`, c);
+        for (const r of rows) out.get(r.username)?.push(rowDev(r));
+      }
+      return out;
+    },
     async getDevice(u, d) { const r = (await db.q('SELECT * FROM devices WHERE username=$1 AND device=$2', [u, d]))[0]; return r ? rowDev(r) : null; },
     async putDevice(u, d, cert, spk) {
       await db.run('INSERT INTO devices (username, device, cert, spk, created_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (username, device) DO UPDATE SET cert=excluded.cert, spk=excluded.spk', [u, d, JSON.stringify(cert), JSON.stringify(spk), Date.now()]);
@@ -63,6 +73,20 @@ function api(db) {
       return rows[0] ? JSON.parse(rows[0].pk) : null;
     },
     async enqueue(u, d, item) { await db.run('INSERT INTO queue (username, device, id, item, ts) VALUES ($1,$2,$3,$4,$5)', [u, d, item.id, JSON.stringify(item), item.ts]); },
+    async queueCountsMany(users) { // Map "user:device" -> queued items
+      const out = new Map();
+      for (let i = 0; i < users.length; i += 500) {
+        const c = users.slice(i, i + 500);
+        for (const r of await db.q(`SELECT username, device, COUNT(*) AS n FROM queue WHERE username IN (${c.map((_, j) => '$' + (j + 1)).join(',')}) GROUP BY username, device`, c)) out.set(r.username + ':' + r.device, Number(r.n));
+      }
+      return out;
+    },
+    async enqueueMany(targets, item) { // one transaction for a whole group fan-out
+      const json = JSON.stringify(item);
+      for (let i = 0; i < targets.length; i += 1000) {
+        await db.tx(async (t) => { for (const r of targets.slice(i, i + 1000)) await t.run('INSERT INTO queue (username, device, id, item, ts) VALUES ($1,$2,$3,$4,$5)', [r.u, r.d, item.id, json, item.ts]); });
+      }
+    },
     async listQueue(u, d, limit = 500) { return (await db.q('SELECT item FROM queue WHERE username=$1 AND device=$2 ORDER BY seq LIMIT ' + Number(limit), [u, d])).map((r) => JSON.parse(r.item)); },
     async ackQueue(u, d, ids) {
       if (!ids.length) return;

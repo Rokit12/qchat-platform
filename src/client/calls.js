@@ -138,7 +138,7 @@ export async function onSignal(from, fd, p, chatId, users) {
     }
     case 'answer': { const peer = call.peers.get(id); if (!peer) return; setRecvKey(id, p); await peer.pc.setRemoteDescription({ type: 'answer', sdp: p.sdp }); return; }
     case 'key': setRecvKey(id, p); return;
-    case 'leave': if (call.ringing && from === call.caller.u && !call.g) return end('Missed'); closePeer(id, true); return;
+    case 'leave': if (call.ringing && from === call.caller.u) return end('Missed'); closePeer(id, true); return; // caller gave up before we answered
     case 'decline': if (!call.g && call.role === 'caller') end('Declined'); return;
     case 'busy': if (!call.g && call.role === 'caller') end('Busy'); return;
   }

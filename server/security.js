@@ -13,10 +13,14 @@ export const LIMITS = {
   powBits: cfg('POW_BITS', 18),                     // proof-of-work difficulty for enrolment (~0.5 s in a browser)
   powBitsMax: cfg('POW_BITS_MAX', 24),
   lookupPerMin: cfg('LOOKUP_PER_MIN', 120),         // username lookups per account per minute (anti-enumeration)
-  newContactsPerDay: cfg('NEW_CONTACTS_PER_DAY', 300),
-  newContactsPerDayNew: cfg('NEW_CONTACTS_PER_DAY_NEW_ACCOUNT', 60),
+  newContactsPerDay: cfg('NEW_CONTACTS_PER_DAY', 4000),        // enough to join/run a 3,500-member group
+  newContactsPerDayNew: cfg('NEW_CONTACTS_PER_DAY_NEW_ACCOUNT', 400),
   newContactsPerDayReported: cfg('NEW_CONTACTS_PER_DAY_REPORTED', 10),
   sendPerMin: cfg('SEND_PER_MIN', 900),
+  deliveriesPerHour: cfg('DELIVERIES_PER_HOUR', 250000),     // device deliveries per account per hour (anti-spam for big groups)
+  bulkLookupPerHour: cfg('BULK_LOOKUP_PER_HOUR', 10000),
+  maxGroupMembers: cfg('MAX_GROUP_MEMBERS', 3500),
+  maxFanoutDevices: cfg('MAX_FANOUT_DEVICES', 20000),
   pinMaxAttempts: cfg('PIN_MAX_ATTEMPTS', 10),       // wrong PINs before PIN login is permanently wiped
   pinTriesPerIp: cfg('PIN_TRIES_PER_IP', 30),       // PIN attempts per IP per hour (across all accounts)
   pinBackoff: cfg('PIN_BACKOFF', 1),                // 0 disables lockout delays (tests only)

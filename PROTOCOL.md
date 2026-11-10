@@ -75,11 +75,17 @@ The recipient verifies the signature against the sender's certified device key *
 - **History transfer:** a new device asks for history with `sync_req`. An existing device asks the user to confirm, then sends chunked `sync_data` over the ratchet.
 - **New‑device alert:** every newly linked device triggers an alert on the account's other devices.
 
-## 7. Groups
+## 7. Groups (up to 3,500 members)
 
-Groups are managed by clients and fanned out pairwise, so each message is encrypted for every member device's ratchet.
-- **Group metadata** (name, members, admins) is a signed, encrypted payload. It's only accepted from current admins, or from the creator when the group is first seen.
-- **Removed members** get the final metadata update and are no longer included in future fan‑out.
+Groups are managed by clients. Group **messages** use **sender keys** (the approach Signal and WhatsApp use for large groups), so a message costs the same — about 4.6 KB plus content — whether the group has 3 or 3,500 members.
+
+- **Sender chain:** every device keeps one chain per group: `{kid, CK, n}`. For each message: `mk = HMAC(CK, 0x01)`, then `CK = HMAC(CK, 0x02)` (forward secrecy inside the chain); the message key is `HKDF(mk, "qchat-gmsg-v1|g")`.
+- **Key distribution:** the chain key goes to every member device as a `skey` payload inside the normal **post‑quantum double ratchet** (ML‑KEM‑768 + ML‑DSA‑65), in envelopes of up to 1,000 devices. A device that missed it (new device, unreachable at the time) asks the sender with `skey_req`; the sender answers in batches, never with messages older than when that person could have joined.
+- **Envelope v3:** `{v:3, from, fd, id, g, kid, n, iv, ct, sig}`; `ct = AES‑256‑GCM(key, payload, AAD = "qchat-env-v3|id|from|fd|g|kid|n")`, `sig` = the sender device's **ML‑DSA‑65** signature. Other members hold the chain key but can't forge messages in someone else's name. A chain is only accepted from the device that owns it.
+- **Rotation:** when anyone leaves or is removed, or a member unlinks a device, every sender starts a fresh chain, so they can't read anything sent afterwards. Added members get the chain from that point on only.
+- **Fan‑out:** the client addresses `{u}` (a user); the server expands it to all of that user's current devices with bulk queries, in one transaction, with a per‑account delivery quota (`DELIVERIES_PER_HOUR`).
+- **Group metadata** (name, members, admins) is a signed, encrypted payload. It's only accepted from current admins, or from the creator when the group is first seen. Above 256 members it goes via the group key, and pairwise to people just added or removed.
+- **Large groups (over 256):** no per‑member delivered/read receipts or typing indicators (like WhatsApp), and they're not used as a Status audience. Calls are for groups of up to 8.
 
 ## 8. Calls
 

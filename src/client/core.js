@@ -2,6 +2,7 @@
 import * as C from '../shared/crypto.js';
 import { newSession, needsBundle } from '../shared/ratchet.js';
 import { seal, open } from '../shared/envelope.js';
+import { newSenderKey, exportSenderKey, sealGroup, openGroup, storeReceivedKey } from '../shared/senderkey.js';
 import * as db from './store.js';
 import { mutex, deviceName } from './util.js';
 import { pinKeys, sealSeeds, openSeeds } from '../shared/pin.js';
@@ -16,7 +17,11 @@ export const S = {
   contacts: {},       // username -> { aik, listVersion, devices:{id:{sigPk,name,created}}, displayName, about, avatar, verified, fetched }
   sessions: {},       // "user:device" -> ratchet session
   outbox: {}, seen: new Set(),
+  gsk: {},            // group id -> my sending chain {kid, ck, n, hist, floor, dist:{"u:d":1}}
+  gskr: {},           // "g|user|device" -> receiving chains {kid: {ck, n, skipped}}
+  gpend: {},          // "g|user|device" -> group envelopes waiting for that sender's key
 };
+export const BATCH = 1000; // recipients per multi-recipient envelope
 export const hooks = { onPayload: async () => {}, onDecryptFail: () => {}, onReady: () => {}, onServer: () => {}, onOnboard: () => {}, onKeyChange: () => {} };
 export const ME = () => S.id.user;
 export const DEV = () => S.id.dev.device;
@@ -34,6 +39,9 @@ export async function loadCrypto() {
   S.contacts = (await db.get('contacts')) || {};
   S.outbox = (await db.get('outbox')) || {};
   S.seen = new Set((await db.get('seen')) || []);
+  for (const k of await db.keys('gsk:')) S.gsk[k.slice(4)] = await db.get(k);
+  for (const k of await db.keys('gskr:')) S.gskr[k.slice(5)] = await db.get(k);
+  S.gpend = (await db.get('gpend')) || {};
 }
 export function newIdentity(user, seeds) {
   const dev = { ...C.newDevice(), name: deviceName() };
@@ -131,7 +139,7 @@ async function onServer(m) {
       ready = true; backoff = 1000; S.me = m.me; S.ice = m.ice; S.vapid = m.vapid; S.pushOn = m.pushOn;
       if (enroll) { const e = enroll; enroll = null; await db.set('prekeys', S.pk); e.resolve(m); }
       await maintainPrekeys(m.prekeys.otpks);
-      for (const [id, o] of Object.entries(S.outbox)) wsSend({ t: 'send', id, to: o.to, env: o.env, push: o.push });
+      for (const [k, o] of Object.entries(S.outbox)) wsSend({ t: 'send', id: o.id || k, to: o.to, env: o.env, push: o.push });
       await refreshUser(ME());
       hooks.onReady(m);
       return;
@@ -140,7 +148,7 @@ async function onServer(m) {
     case 'prekey_status': return;
     case 'env': return onEnv(m);
     case 'sent':
-      if (m.ok && S.outbox[m.id]) { delete S.outbox[m.id]; db.set('outbox', S.outbox); }
+      if (m.ok) { const k = Object.keys(S.outbox).find((k) => (S.outbox[k].id || k) === m.id); if (k) { delete S.outbox[k]; db.set('outbox', S.outbox); } }
       return hooks.onServer(m);
     case 'devices_changed':
       if (S.contacts[m.username]) S.contacts[m.username].fetched = 0;
@@ -179,6 +187,19 @@ export function applyUser(p) {
   if (aikChanged) hooks.onKeyChange(u);
   saveContacts();
 }
+const noSuchUser = new Map();
+/** Bulk-load contacts we don't know yet (or that are stale) — 500 per request, used for big groups. */
+export async function prefetch(users, { stale = false } = {}) {
+  const now = Date.now();
+  const need = [...new Set(users)].filter((u) => { const c = S.contacts[u]; return (!c?.devices && !(noSuchUser.get(u) > now)) || (stale && c && now - (c.fetched || 0) > CONTACT_STALE); });
+  for (let i = 0; i < need.length; i += 500) {
+    const part = need.slice(i, i + 500);
+    const r = await rpc({ t: 'lookup', usernames: part }, 'lookup', 20000);
+    if (!r?.users) break;
+    for (const p of r.users) applyUser(p);
+    const got = new Set(r.users.map((p) => p.username)); for (const u of part) if (!got.has(u)) noSuchUser.set(u, now + CONTACT_STALE);
+  }
+}
 async function contactFor(u, fresh = false) {
   const c = S.contacts[u];
   if (!fresh && c?.devices && Date.now() - (c.fetched || 0) < CONTACT_STALE) return c;
@@ -194,21 +215,31 @@ export function sendPayload(users, payload, opts = {}) {
   return lock(async () => {
     const id = opts.id || C.randId(12);
     const list = new Set(users); if (opts.self !== false) list.add(ME());
+    if (list.size > 8) await prefetch([...list]);
+    const only = opts.devices ? new Set(opts.devices.map((x) => sk(x.u, x.d))) : null;
     const targets = [];
     for (const u of list) {
-      const c = await contactFor(u); if (!c?.devices) continue;
+      const c = list.size > 8 ? S.contacts[u] : await contactFor(u); if (!c?.devices) continue;
       for (const [d, info] of Object.entries(c.devices)) {
         if (u === ME() && d === DEV()) continue;
-        if (opts.devices && !opts.devices.some((x) => x.u === u && x.d === d)) continue;
+        if (only && !only.has(sk(u, d))) continue;
         targets.push({ user: u, device: d, sigPk: info.sigPk });
       }
     }
     if (!targets.length) return false;
     const need = targets.filter((t) => needsBundle(S.sessions[sk(t.user, t.device)]));
     const bundles = {};
-    for (const u of new Set(need.map((t) => t.user))) {
-      const r = await rpc({ t: 'bundle', username: u, devices: need.filter((t) => t.user === u).map((t) => t.device) }, 'bundle');
-      for (const b of r?.bundles || []) bundles[sk(u, b.device)] = b;
+    const needUsers = [...new Set(need.map((t) => t.user))];
+    const devsOf = (u) => need.filter((t) => t.user === u).map((t) => t.device);
+    if (needUsers.length === 1) {
+      const r = await rpc({ t: 'bundle', username: needUsers[0], devices: devsOf(needUsers[0]) }, 'bundle');
+      for (const b of r?.bundles || []) bundles[sk(needUsers[0], b.device)] = b;
+    } else {
+      for (let i = 0; i < needUsers.length; i += 200) { // bulk form for big groups
+        const r = await rpc({ t: 'bundle', users: needUsers.slice(i, i + 200).map((u) => ({ username: u, devices: devsOf(u) })) }, 'bundle', 20000);
+        for (const b of r?.bundles || []) bundles[sk(b.username, b.device)] = b;
+        if (!r || r.error) break;
+      }
     }
     const recips = [];
     for (const t of targets) {
@@ -216,20 +247,133 @@ export function sendPayload(users, payload, opts = {}) {
       let bundle;
       if (needsBundle(S.sessions[k])) {
         const b = bundles[k];
-        if (!b || !C.verifyPrekey(b.spk, t.user, t.device, 'spk', t.sigPk) || (b.otpk && !C.verifyPrekey(b.otpk, t.user, t.device, 'otpk', t.sigPk))) { console.warn('no valid prekey bundle for', k); continue; }
+        if (!b || !C.verifyPrekey(b.spk, t.user, t.device, 'spk', t.sigPk) || (b.otpk && !C.verifyPrekey(b.otpk, t.user, t.device, 'otpk', t.sigPk))) { if (needUsers.length < 30) console.warn('no valid prekey bundle for', k); continue; }
         bundle = { sigPk: t.sigPk, spk: b.spk, otpk: b.otpk || undefined };
       }
       S.sessions[k] ||= newSession(t.user, t.device);
       recips.push({ user: t.user, device: t.device, session: S.sessions[k], bundle });
     }
     if (!recips.length) return false;
-    const env = await seal({ user: ME(), device: DEV(), sigSk: C.unb64(S.id.dev.sigSk) }, id, recips, payload);
-    for (const r of recips) await db.set('sess:' + sk(r.user, r.device), r.session); // persist ratchet state before anything leaves
-    const to = recips.map((r) => ({ u: r.user, d: r.device }));
-    if (!opts.ephemeral) { S.outbox[id] = { to, env, push: opts.push }; await db.set('outbox', S.outbox); }
-    wsSend({ t: 'send', id, to, env, ephemeral: !!opts.ephemeral, push: opts.push });
-    return true;
+    const me = { user: ME(), device: DEV(), sigSk: C.unb64(S.id.dev.sigSk) };
+    const sent = [];
+    for (let i = 0; i < recips.length; i += BATCH) { // ≤1,000 devices per envelope (a 3,500-member group is a few envelopes)
+      const part = recips.slice(i, i + BATCH);
+      const env = await seal(me, id, part, payload);
+      for (const r of part) await db.set('sess:' + sk(r.user, r.device), r.session); // persist ratchet state before anything leaves
+      const to = part.map((r) => ({ u: r.user, d: r.device }));
+      const key = i ? id + '#' + i : id;
+      if (!opts.ephemeral) { S.outbox[key] = { id, to, env, push: opts.push }; await db.set('outbox', S.outbox); }
+      wsSend({ t: 'send', id, to, env, ephemeral: !!opts.ephemeral, push: opts.push });
+      sent.push(...to);
+    }
+    return sent;
   });
+}
+
+// ---------------------------------------------------------------- big groups: sender keys
+// Each device has one symmetric chain per group (see shared/senderkey.js). The chain key is handed to every member
+// device over the post-quantum pairwise sessions; after that every message is encrypted ONCE (constant size) and the
+// server fans it out to all members. Members missing a key ask the sender for it ("skey_req").
+const saveGsk = (g) => (S.gsk[g] ? db.set('gsk:' + g, S.gsk[g]) : db.del('gsk:' + g));
+/** Someone left / was removed (or a device was unlinked): start a new chain so they can't read what comes next. */
+export function groupRotate(g) { return lock(async () => { if (S.gsk[g]) { delete S.gsk[g]; await saveGsk(g); } }); }
+/** New members: they get the chain from now on — never older messages. */
+export function groupMembersAdded(g) { return lock(async () => { const st = S.gsk[g]; if (st) { st.floor = st.n; await saveGsk(g); } }); }
+
+async function distributeKey(g, members) {
+  const users = [...new Set([...members, ME()])];
+  const st = await lock(async () => {
+    let st = S.gsk[g];
+    // a member's device disappeared from their (signed) device list → that device must not keep reading
+    if (st && Object.keys(st.dist || {}).some((k) => { const [u, d] = k.split(':'); return !users.includes(u) || (S.contacts[u]?.devices && !S.contacts[u].devices[d]); })) st = null;
+    if (!st) { st = { ...newSenderKey(), dist: {}, floor: 0 }; S.gsk[g] = st; await saveGsk(g); }
+    return st;
+  });
+  await prefetch(users);
+  const devices = [];
+  const now = Date.now(); st.miss ||= {};
+  for (const u of users) for (const d of Object.keys(S.contacts[u]?.devices || {})) { const k = sk(u, d); if (!(u === ME() && d === DEV()) && !st.dist[k] && !(st.miss[k] > now)) devices.push({ u, d }); }
+  if (!devices.length) return st;
+  const k = exportSenderKey(st);
+  const sent = await sendPayload([...new Set(devices.map((x) => x.u))], { type: 'skey', g, kid: k.kid, ck: k.ck, n: k.n }, { devices, self: true }) || [];
+  await lock(async () => {
+    if (S.gsk[g] !== st) return;
+    for (const x of sent) st.dist[sk(x.u, x.d)] = 1;
+    for (const x of devices) if (!st.dist[sk(x.u, x.d)]) st.miss[sk(x.u, x.d)] = now + 10 * 60e3; // unreachable for now: they'll ask (skey_req)
+    await saveGsk(g);
+  });
+  return st; // devices we couldn't reach yet will ask for the key themselves
+}
+/** Send one payload to a group: one ciphertext, fanned out by the server to every member's devices. */
+export async function groupSend(g, members, payload, opts = {}) {
+  const id = opts.id || C.randId(12);
+  for (let tries = 0; tries < 2; tries++) {
+    const st = await distributeKey(g, members);
+    const ok = await lock(async () => {
+      if (S.gsk[g] !== st) return null; // rotated meanwhile → redistribute
+      const env = await sealGroup({ user: ME(), device: DEV(), sigSk: C.unb64(S.id.dev.sigSk) }, id, g, st, payload);
+      await saveGsk(g); // persist the advanced chain before the message leaves
+      const to = [...new Set([...members, ME()])].map((u) => ({ u }));
+      if (!opts.ephemeral) { S.outbox[id] = { id, to, env, push: opts.push }; await db.set('outbox', S.outbox); }
+      wsSend({ t: 'send', id, to, env, ephemeral: !!opts.ephemeral, push: opts.push });
+      return true;
+    });
+    if (ok) return true;
+  }
+  return false;
+}
+
+const skReq = {}; let skReqT; const skAsked = {};
+function onSkeyReq(from, fd, p) {
+  if (typeof p.g !== 'string' || !S.gsk[p.g] || !hooks.isGroupMember?.(p.g, from)) return;
+  const k = p.g + '|' + sk(from, fd) + '|' + S.gsk[p.g].kid;
+  if (Date.now() - (skAsked[k] || 0) < 30000) return; skAsked[k] = Date.now();
+  const want = p.kid === S.gsk[p.g].kid && Number.isInteger(p.n) ? p.n : null;
+  (skReq[p.g] ||= []).push({ u: from, d: fd, n: want });
+  clearTimeout(skReqT); skReqT = setTimeout(flushSkeyReqs, 800); // answer requests in batches (≤1,000 devices per envelope)
+}
+async function flushSkeyReqs() {
+  for (const [g, reqs] of Object.entries(skReq)) {
+    delete skReq[g];
+    const st = S.gsk[g]; if (!st) continue;
+    const ns = reqs.map((r) => r.n).filter((n) => n != null);
+    const from = Math.max(st.floor || 0, ns.length ? Math.min(...ns) : st.n); // never older than when they could have joined
+    const k = exportSenderKey(st, from);
+    const devices = reqs.map(({ u, d }) => ({ u, d }));
+    const sent = await sendPayload([...new Set(devices.map((x) => x.u))], { type: 'skey', g, kid: k.kid, ck: k.ck, n: k.n }, { devices, self: false });
+    if (sent) await lock(async () => { if (S.gsk[g] === st) { for (const x of sent) st.dist[sk(x.u, x.d)] = 1; await saveGsk(g); } });
+  }
+}
+async function onSkey(from, fd, p) {
+  if (typeof p.g !== 'string' || p.g.length > 64 || typeof p.kid !== 'string' || typeof p.ck !== 'string' || C.unb64(p.ck).length !== 32 || !Number.isInteger(p.n) || p.n < 0) return;
+  const key = p.g + '|' + from + '|' + fd; // a chain is only ever accepted from the device that owns it
+  await lock(async () => { S.gskr[key] = storeReceivedKey(S.gskr[key], { kid: p.kid, ck: p.ck, n: p.n }); await db.set('gskr:' + key, S.gskr[key]); });
+  const waiting = S.gpend[key]; if (waiting) { delete S.gpend[key]; db.set('gpend', S.gpend); for (const it of waiting) onEnv(it); }
+}
+async function decryptGroup(item, retried = false) {
+  const env = item.env;
+  if (env.from !== item.from || env.fd !== item.fd || env.id !== item.id) return null;
+  let c = S.contacts[item.from];
+  if (!c?.devices?.[item.fd] || retried) c = await contactFor(item.from, true);
+  const dev = c?.devices?.[item.fd]; if (!dev) return null;
+  const key = env.g + '|' + item.from + '|' + item.fd;
+  try {
+    const r = await openGroup(env, dev.sigPk, S.gskr[key]);
+    S.gskr[key] = r.rs; await db.set('gskr:' + key, r.rs);
+    if (r.payload.g !== env.g) return null; // the payload must belong to the group the envelope claims
+    return r.payload;
+  } catch (e) {
+    if (e.message === 'bad signature' && !retried) return decryptGroup(item, true);
+    if (e.message === 'no sender key') {
+      const q = (S.gpend[key] ||= []); if (q.length < 300) q.push(item); db.set('gpend', S.gpend);
+      const ak = key + '|' + env.kid;
+      if (Date.now() - (skAsked[ak] || 0) > 30000) {
+        skAsked[ak] = Date.now();
+        setTimeout(() => sendPayload([item.from], { type: 'skey_req', g: env.g, kid: env.kid, n: env.n }, { devices: [{ u: item.from, d: item.fd }], self: false }), 0);
+      }
+    } else if (!/duplicate|replayed/.test(e.message)) console.warn('group decrypt failed', e.message);
+    return null;
+  }
 }
 export function resetSendSession(u, d) {
   return lock(async () => { const s = S.sessions[sk(u, d)]; if (!s) return; s.send = null; s.theirR = null; await db.set('sess:' + sk(u, d), s); });
@@ -242,7 +386,9 @@ function onEnv(item) { chain = chain.then(() => processEnv(item)).catch((e) => c
 async function processEnv(item) {
   if (S.seen.has(item.id)) return ack(item.id);
   if (hooks.isBlocked?.(item.from)) return ack(item.id);
-  const payload = await lock(() => decrypt(item));
+  const payload = await lock(() => (item.env?.v === 3 ? decryptGroup(item) : decrypt(item)));
+  if (payload?.type === 'skey') { S.seen.add(item.id); if (item.env?.v !== 3) await onSkey(item.from, item.fd, payload); return ack(item.id); }
+  if (payload?.type === 'skey_req') { S.seen.add(item.id); if (item.env?.v !== 3) onSkeyReq(item.from, item.fd, payload); return ack(item.id); }
   if (payload) {
     S.seen.add(item.id); clearTimeout(seenT); seenT = setTimeout(() => db.set('seen', [...S.seen].slice(-5000)), 500);
     try { await hooks.onPayload(item.from, item.fd, item.ts, item.id, payload); } catch (e) { console.error('handler', e); }

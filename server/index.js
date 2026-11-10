@@ -351,6 +351,16 @@ async function handle(ws, m) {
 
   switch (m.t) {
     case 'lookup': {
+      if (Array.isArray(m.usernames)) { // bulk lookup for big groups: counted per name against an hourly budget
+        const names = [...new Set(m.usernames.slice(0, 500).map((x) => String(x || '').toLowerCase().replace(/^@/, '')))].filter((x) => USERNAME_RE.test(x));
+        if ((await sec.hit('lookupn:' + me, 3600, names.length)) > LIMITS.bulkLookupPerHour) {
+          if ((await sec.hit('enumflag:' + me, 300)) === 1) await sec.event('enumeration_suspected', 'medium', { ip: ws.ip, user: me, detail: { bulk: names.length } });
+          return send(ws, { t: 'lookup', rid: m.rid, users: undefined, error: 'rate_limited' });
+        }
+        const users = [];
+        for (const u of names) { const p = await publicUser(u); if (p) users.push(p); }
+        return send(ws, { t: 'lookup', rid: m.rid, users });
+      }
       if (!(await sec.allow('lookup:' + me, LIMITS.lookupPerMin, 60))) {
         if ((await sec.hit('enumflag:' + me, 300)) === 1) await sec.event('enumeration_suspected', 'medium', { ip: ws.ip, user: me });
         await sec.strike(ws.ip, 2, 'enumeration'); return send(ws, { t: 'lookup', rid: m.rid, user: undefined, error: 'rate_limited' });
@@ -360,6 +370,22 @@ async function handle(ws, m) {
     }
     case 'bundle': { // prekey bundles for starting sessions; hands out each one-time prekey once
       if (!take(ws.bundleBucket, 30, 0.5)) return send(ws, { t: 'bundle', rid: m.rid, error: 'rate_limited' });
+      if (Array.isArray(m.users)) { // bulk form (big groups): [{username, devices}] ≤ 200, each user counted against the contact quota
+        const quota = await contactQuota(me); const out = []; let quotaHit = false;
+        for (const q of m.users.slice(0, 200)) {
+          const u = String(q?.username || ''); if (!USERNAME_RE.test(u)) continue;
+          const user = await store.getUser(u); if (!user) continue;
+          if (u !== me && !(await sec.allow('contacts:' + me, quota, 86400))) { quotaHit = true; break; }
+          const want = new Set(Array.isArray(q.devices) ? q.devices : user.deviceList.devices);
+          for (const d of await store.getDevices(u)) {
+            if (!want.has(d.device) || !user.deviceList.devices.includes(d.device)) continue;
+            out.push({ username: u, device: d.device, cert: d.cert, spk: d.spk, otpk: await store.takeOtpk(u, d.device) });
+            if (await store.countOtpks(u, d.device) < 10) toDevice(u, d.device, { t: 'prekeys_low' });
+          }
+        }
+        if (quotaHit && (await sec.hit('spamflag:' + me, 3600)) === 1) await sec.event('spam_suspected', 'high', { ip: ws.ip, user: me, detail: { reason: 'too many new conversations' } });
+        return send(ws, { t: 'bundle', rid: m.rid, bundles: out, error: quotaHit ? 'quota' : undefined });
+      }
       const u = String(m.username || ''); const user = await store.getUser(u);
       if (!user) return send(ws, { t: 'bundle', rid: m.rid, bundles: [] });
       if (u !== me && !(await sec.allow('contacts:' + me, await contactQuota(me), 86400))) {
@@ -418,22 +444,45 @@ async function handle(ws, m) {
       const id = String(m.id || '').slice(0, 64);
       if (!id || !validEnvelope(m.env) || !Array.isArray(m.to)) { await sec.strike(ws.ip, 2, 'bad_envelope'); return send(ws, { t: 'sent', id, ok: false }); }
       if (!(await sec.allow('send:' + me, LIMITS.sendPerMin, 60))) { await sec.event('send_flood', 'medium', { ip: ws.ip, user: me }); return send(ws, { t: 'sent', id, ok: false, error: 'rate_limited' }); }
+      if (m.env.v === 3 && (m.env.from !== me || m.env.fd !== myDev)) { await sec.strike(ws.ip, 4, 'spoofed_sender'); return send(ws, { t: 'sent', id, ok: false }); }
       const item = { id, from: me, fd: myDev, ts: Date.now(), env: m.env };
-      const seen = new Set(); const targets = [];
-      for (const r of m.to.slice(0, 1500)) {
-        const key = r?.u + ':' + r?.d; if (seen.has(key) || (r.u === me && r.d === myDev)) continue; seen.add(key);
-        if (USERNAME_RE.test(r.u) && DEVICE_RE.test(r.d)) targets.push(r);
+      // m.to entries: {u, d} (one device) or {u} (every current device of that user — used by big groups so the
+      // sender doesn't have to list ~8,000 devices). Users are capped at the max group size.
+      const seen = new Set(); const wantAll = new Set(); const pairs = []; const users = new Set();
+      for (const r of m.to.slice(0, LIMITS.maxGroupMembers + 1500)) {
+        if (!r || typeof r.u !== 'string' || !USERNAME_RE.test(r.u)) continue;
+        if (r.d === undefined) { if (users.size < LIMITS.maxGroupMembers + 10 || users.has(r.u)) { wantAll.add(r.u); users.add(r.u); } continue; }
+        const key = r.u + ':' + r.d; if (seen.has(key) || !DEVICE_RE.test(r.d)) continue;
+        seen.add(key); pairs.push(r); users.add(r.u);
       }
-      const devCache = new Map();
-      for (const r of targets) {
-        if (!devCache.has(r.u)) devCache.set(r.u, new Map((await store.getDevices(r.u)).map((d) => [d.device, d])));
-        const dev = devCache.get(r.u).get(r.d); if (!dev) continue;
-        if (!m.ephemeral) {
-          if (await store.queueCount(r.u, r.d) >= MAX_QUEUE_PER_DEVICE) { if ((await sec.hit('qfull:' + r.u, 3600)) === 1) await sec.event('queue_full', 'medium', { user: r.u, detail: { from: me } }); continue; }
-          await store.enqueue(r.u, r.d, item);
+      const devMap = users.size === 1 ? new Map([[[...users][0], await store.getDevices([...users][0])]]) : await store.getDevicesMany([...users]);
+      const targets = []; const tseen = new Set();
+      const addT = (u, dev) => { const k = u + ':' + dev.device; if (tseen.has(k) || (u === me && dev.device === myDev)) return; tseen.add(k); targets.push({ u, d: dev.device, dev }); };
+      for (const r of pairs) { const dev = (devMap.get(r.u) || []).find((x) => x.device === r.d); if (dev) addT(r.u, dev); }
+      for (const u of wantAll) for (const dev of devMap.get(u) || []) addT(u, dev);
+      if (targets.length > LIMITS.maxFanoutDevices) targets.length = LIMITS.maxFanoutDevices;
+      if (targets.length > 1 && (await sec.hit('deliv:' + me, 3600, targets.length)) > LIMITS.deliveriesPerHour) {
+        if ((await sec.hit('delivflag:' + me, 3600)) === 1) await sec.event('mass_send', 'high', { ip: ws.ip, user: me, detail: { devices: targets.length } });
+        return send(ws, { t: 'sent', id, ok: false, error: 'rate_limited' });
+      }
+      let stored = targets;
+      if (!m.ephemeral) {
+        const counts = targets.length > 20 ? await store.queueCountsMany([...users]) : null;
+        stored = [];
+        for (const r of targets) {
+          const n = counts ? (counts.get(r.u + ':' + r.d) || 0) : await store.queueCount(r.u, r.d);
+          if (n >= MAX_QUEUE_PER_DEVICE) { if ((await sec.hit('qfull:' + r.u, 3600)) === 1) await sec.event('queue_full', 'medium', { user: r.u, detail: { from: me } }); continue; }
+          stored.push(r);
         }
+        if (stored.length > 20) await store.enqueueMany(stored, item); else for (const r of stored) await store.enqueue(r.u, r.d, item);
+      }
+      const online = new Map();
+      for (const r of stored) {
         await toDevice(r.u, r.d, { t: 'env', ...item });
-        if (m.push && dev.push && r.u !== me && !(await bus.onlineDevices(r.u)).includes(r.d)) sendPush(r.u, r.d, dev.push, { from: me, kind: ['call', 'live'].includes(m.push) ? m.push : 'msg' });
+        if (m.push && r.dev.push && r.u !== me) {
+          if (!online.has(r.u)) online.set(r.u, await bus.onlineDevices(r.u));
+          if (!online.get(r.u).includes(r.d)) sendPush(r.u, r.d, r.dev.push, { from: me, kind: ['call', 'live'].includes(m.push) ? m.push : 'msg' });
+        }
       }
       metric('messages'); metric('deliveries', targets.length); metric('bytes', JSON.stringify(m.env).length); userSent(me);
       return send(ws, { t: 'sent', id, ts: item.ts, ok: true });
@@ -559,10 +608,15 @@ async function contactQuota(u) {
 }
 const B64_RE = /^[A-Za-z0-9+/=]*$/;
 function validEnvelope(env) { // shape check only — contents stay opaque
+  if (env && env.v === 3) { // sender-key group message: one ciphertext for every member
+    const str = (x, max) => typeof x === 'string' && x.length <= max;
+    return str(env.from, 32) && str(env.fd, 64) && str(env.id, 64) && str(env.g, 64) && str(env.kid, 32) && Number.isInteger(env.n) && env.n >= 0
+      && str(env.iv, 32) && B64_RE.test(env.iv) && typeof env.ct === 'string' && B64_RE.test(env.ct) && str(env.sig, 6000) && B64_RE.test(env.sig);
+  }
   if (!env || typeof env !== 'object' || env.v !== 2) return false;
   if (typeof env.iv !== 'string' || env.iv.length > 32 || typeof env.ct !== 'string' || typeof env.sig !== 'string' || env.sig.length > 6000) return false;
   if (!B64_RE.test(env.iv) || !B64_RE.test(env.sig)) return false;
-  if (!Array.isArray(env.keys) || !env.keys.length || env.keys.length > 1500) return false;
+  if (!Array.isArray(env.keys) || !env.keys.length || env.keys.length > 2000) return false;
   for (const k of env.keys) if (!k || typeof k.u !== 'string' || typeof k.d !== 'string' || typeof k.w !== 'string' || k.w.length > 64 || typeof k.h !== 'object') return false;
   return true;
 }
