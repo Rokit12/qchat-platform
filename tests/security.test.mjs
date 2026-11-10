@@ -7,6 +7,7 @@ import path from 'node:path';
 import WebSocket from 'ws';
 import * as C from '../src/shared/crypto.js';
 import { startServer, Client } from './helpers.mjs';
+import { adminLogin, BOOT } from './admin-helpers.mjs';
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'qsec-'));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -69,7 +70,7 @@ test('WebSocket hardening: origin check, per-IP caps, auth timeout, oversized fr
 });
 
 test('Account protection: PoW, reserved names, impersonation, mass sign-up, takeover detection + lockout + owner alerts', async () => {
-  const s = await startServer(3303, { DATA_DIR: tmp(), REG_PER_IP_HOUR: '4', ADMIN_TOKEN: 'test-admin-token-123' });
+  const s = await startServer(3303, { DATA_DIR: tmp(), REG_PER_IP_HOUR: '4', ...BOOT });
   try {
     const noPow = new Client(3303, uniq('pow'), C.accountKeys(C.newAccountSeeds()));
     assert.match((await noPow.login({ register: true, tamper: 'pow' })).error, /Proof-of-work/); noPow.close();
@@ -101,12 +102,13 @@ test('Account protection: PoW, reserved names, impersonation, mass sign-up, take
     for (let i = 0; i < 4; i++) { const c = new Client(3303, uniq('bulk'), C.accountKeys(C.newAccountSeeds())); const r = await c.login({ register: true }); c.close(); if (r.error && /Too many new accounts/.test(r.error)) blocked = true; }
     assert.ok(blocked, 'per-IP registration limit');
 
-    // admin dashboard
-    assert.equal((await get(3303, '/admin/api/summary')).status, 401);
-    assert.equal((await get(3303, '/admin/api/summary', { authorization: 'Bearer wrong' })).status, 401);
-    const sum = await (await get(3303, '/admin/api/summary', { authorization: 'Bearer test-admin-token-123' })).json();
-    for (const t of ['account_takeover_attempt', 'account_locked', 'reserved_username_attempt', 'mass_registration', 'admin_auth_failed']) assert.ok(sum.last24h.byType[t] >= 1, 'event logged: ' + t);
-    const ev = await (await get(3303, `/admin/api/events?user=${owner.user}&minSeverity=high`, { authorization: 'Bearer test-admin-token-123' })).json();
+    // admin dashboard (password + 2FA; failed sign-ins are logged)
+    assert.equal((await get(3303, '/admin/api/overview', { 'x-qchat-admin': '1' })).status, 401);
+    await fetch('http://localhost:3303/admin/api/login', { method: 'POST', headers: { 'x-qchat-admin': '1', 'content-type': 'application/json' }, body: JSON.stringify({ username: BOOT.ADMIN_BOOTSTRAP_USER, password: 'guessing-123456' }) });
+    const adm = await adminLogin(3303);
+    const types = new Set((await adm.api('overview')).body.security7d.map((e) => e.type));
+    for (const t of ['account_takeover_attempt', 'account_locked', 'reserved_username_attempt', 'mass_registration', 'admin_auth_failed']) assert.ok(types.has(t), 'event logged: ' + t);
+    const ev = (await adm.api(`events?user=${owner.user}&minSeverity=high`)).body;
     assert.ok(ev.length >= 6 && ev.every((e) => !String(e.ipHash).includes('127.0.0.1')), 'events stored with hashed IPs');
     assert.equal((await get(3303, '/admin')).status, 200);
     owner.close();
@@ -114,7 +116,7 @@ test('Account protection: PoW, reserved names, impersonation, mass sign-up, take
 });
 
 test('Anti-spam & anti-enumeration: lookup limits, new-contact quota, reports', async () => {
-  const s = await startServer(3304, { DATA_DIR: tmp(), LOOKUP_PER_MIN: '5', NEW_CONTACTS_PER_DAY_NEW_ACCOUNT: '2', ADMIN_TOKEN: 'tok-abcdef' });
+  const s = await startServer(3304, { DATA_DIR: tmp(), LOOKUP_PER_MIN: '5', NEW_CONTACTS_PER_DAY_NEW_ACCOUNT: '2', ...BOOT });
   try {
     const users = [];
     for (let i = 0; i < 4; i++) { const c = new Client(3304, uniq('u'), C.accountKeys(C.newAccountSeeds())); await c.login({ register: true }); users.push(c); }
@@ -125,9 +127,84 @@ test('Anti-spam & anti-enumeration: lookup limits, new-contact quota, reports', 
     assert.equal((await spammer.rpc({ t: 'bundle', username: victims[1].user }, 'bundle')).bundles.length, 1);
     assert.equal((await spammer.rpc({ t: 'bundle', username: victims[2].user }, 'bundle')).error, 'quota', 'new accounts can only start a few conversations per day');
     for (const v of victims) { v.sendRaw({ t: 'report', username: spammer.user, reason: 'phishing' }); await v.next((m) => m.t === 'report_ok'); }
-    const ev = await (await get(3304, `/admin/api/events?user=${spammer.user}`, { authorization: 'Bearer tok-abcdef' })).json();
+    const ev = (await (await adminLogin(3304)).api(`events?user=${spammer.user}`)).body;
     assert.ok(ev.filter((e) => e.type === 'user_reported').length === 3);
     assert.ok(ev.some((e) => e.type === 'spam_suspected') && ev.some((e) => e.type === 'enumeration_suspected'));
     users.forEach((u) => u.close());
+  } finally { s.kill(); }
+});
+
+// ---------------------------------------------------------------- PIN login
+import { pinKeys, sealSeeds, openSeeds, weakPin } from '../src/shared/pin.js';
+async function setupPin(client, seeds, pin) {
+  const salt = C.rand(16); const { auth, enc } = await pinKeys(pin, salt); const share = C.rand(32);
+  const blob = await sealSeeds(C.concat(seeds.aikSeed, seeds.backupSeed), enc, share, client.user);
+  client.sendRaw({ t: 'pin_set', salt: C.b64(salt), auth: C.b64(auth), share: C.b64(share), blob });
+  return client.next((m) => m.t === 'pin_ok');
+}
+async function tryPin(port, user, pin) { // what a brand-new device does
+  const c = new Client(port, user, null); await c.connect();
+  const params = await c.rpc({ t: 'pin_params', user }, 'pin_params');
+  if (!params.enabled) { c.close(); return { disabled: true }; }
+  const { auth, enc } = await pinKeys(pin, C.unb64(params.salt));
+  c.sendRaw({ t: 'hello', user, device: C.randId(8) });
+  const ch = await c.next((m) => m.t === 'challenge');
+  c.sendRaw({ t: 'pin_unlock', auth: C.b64(auth), pow: await C.solvePow(ch.nonce, user, c.lastDevice, ch.pow) });
+  const r = await c.next((m) => m.t === 'pin_result'); c.close();
+  if (r.ok) { const raw = await openSeeds(r.blob, enc, C.unb64(r.share), user); return { ok: true, seeds: { aikSeed: raw.slice(0, 32), backupSeed: raw.slice(32, 96) } }; }
+  return r;
+}
+
+test('PIN login: right PIN recovers the account, wrong PINs alert the owner, lock out, then wipe', async () => {
+  const dir = tmp();
+  const s = await startServer(3305, { DATA_DIR: dir, PIN_MAX_ATTEMPTS: '5', PIN_PEPPER: 'test-pepper-0123456789abcdef', STRIKE_BAN: '100000' });
+  try {
+    assert.ok(weakPin('123456') && weakPin('111111') && weakPin('121212') && weakPin('19900') && !weakPin('482916'));
+    const seeds = C.newAccountSeeds();
+    const owner = new Client(3305, uniq('pin'), C.accountKeys(seeds)); assert.equal((await owner.login({ register: true })).t, 'ready');
+    assert.equal((await setupPin(owner, seeds, '482916')).enabled, true);
+
+    const ok = await tryPin(3305, owner.user, '482916');
+    assert.ok(ok.ok && C.b64(ok.seeds.aikSeed) === C.b64(seeds.aikSeed), 'correct PIN returns the account seeds');
+    // the recovered seeds can enrol a new device exactly like a recovery key
+    const newDev = new Client(3305, owner.user, C.accountKeys({ aikSeed: ok.seeds.aikSeed, backupSeed: ok.seeds.backupSeed }));
+    assert.equal((await newDev.login()).t, 'ready'); newDev.close();
+
+    // the server database alone can't verify PIN guesses (needs PIN_PEPPER, kept outside the DB)
+    const { DatabaseSync } = await import('node:sqlite');
+    const row = new DatabaseSync(path.join(dir, 'qchat.db')).prepare('SELECT * FROM pin_recovery').get();
+    const { auth } = await pinKeys('482916', C.unb64(row.salt));
+    assert.notEqual(row.verifier, C.b64(auth), 'stored verifier is peppered, not the raw PIN hash');
+
+    for (let i = 1; i <= 2; i++) {
+      const r = await tryPin(3305, owner.user, '000137');
+      assert.equal(r.error, 'wrong'); assert.equal(r.attemptsLeft, 5 - i);
+      const al = await owner.next((m) => m.t === 'security_alert' && m.alert.type === 'pin_failed');
+      assert.equal(al.alert.detail.left, 5 - i);
+    }
+    const third = await tryPin(3305, owner.user, '000138');
+    assert.equal(third.lockedFor, 60000, 'third wrong PIN → 1 minute lockout');
+    const locked = await tryPin(3305, owner.user, '482916');
+    assert.equal(locked.error, 'locked', 'even the right PIN is refused during the lockout');
+    owner.close();
+  } finally { s.kill(); }
+});
+
+test('PIN login: guess limit wipes PIN recovery; per-IP PIN brute force is blocked', async () => {
+  const s = await startServer(3306, { DATA_DIR: tmp(), PIN_MAX_ATTEMPTS: '3', PIN_BACKOFF: '0', PIN_TRIES_PER_IP: '4', STRIKE_BAN: '100000' });
+  try {
+    const seeds = C.newAccountSeeds();
+    const owner = new Client(3306, uniq('wipe'), C.accountKeys(seeds)); await owner.login({ register: true });
+    await setupPin(owner, seeds, '582047');
+    for (const g of ['111112', '222224']) assert.equal((await tryPin(3306, owner.user, g)).error, 'wrong');
+    assert.equal((await tryPin(3306, owner.user, '333336')).error, 'wiped');
+    assert.equal((await owner.next((m) => m.t === 'security_alert' && m.alert.type === 'pin_wiped')).alert.type, 'pin_wiped');
+    assert.ok((await tryPin(3306, owner.user, '582047')).disabled, 'after the wipe even the right PIN cannot recover the account');
+    // an attacker spraying guesses across accounts from one IP hits the per-IP cap
+    const other = new Client(3306, uniq('spray'), C.accountKeys(seeds)); await other.login({ register: true }); await setupPin(other, seeds, '582047');
+    let blocked = false;
+    for (let i = 0; i < 4 && !blocked; i++) { const r = await tryPin(3306, other.user, '90000' + i); if (/Too many PIN attempts/.test(r.error || '')) blocked = true; }
+    assert.ok(blocked, 'per-IP PIN attempt cap');
+    owner.close(); other.close();
   } finally { s.kill(); }
 });

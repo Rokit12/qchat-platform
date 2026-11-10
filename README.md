@@ -18,6 +18,13 @@ A WhatsApp‑style messenger where people find each other **only by username**. 
   - Alerts when a new device is linked to your account.
   - Encrypted local database, with an optional **passcode lock** (Argon2id) and auto‑lock.
   - **Encrypted backups** you can export and import.
+- **PIN login:** log in on any device with your username and a 6‑digit PIN you set at sign‑up. Your recovery key is only needed if you forget your PIN.
+- **Admin dashboard** (`/admin`, sign‑in with email + password + authenticator app):
+  - Every user with their activity timeline.
+  - User management: suspend, force sign‑out, remove devices, reset PIN, delete.
+  - Analytics: sign‑ups, daily active users, message volume, logins, platforms, security.
+  - Security events, IP bans, an audit log and admin roles.
+- **Service status:** live up/down monitoring of every component, with uptime history and outage incidents, on the admin home page, a public `/status` page and the app's home screen.
 - **Hardened against attacks** (details in [SECURITY.md](SECURITY.md)):
   - On‑device phishing detection with a safety screen before any link opens, warnings for unknown contacts and scam messages, a guard against sending your recovery key, and flags for dangerous files.
   - Impersonation blocking.
@@ -37,6 +44,8 @@ npm start               # builds the client, serves http://localhost:3000 (SQLit
 
 Requires Node 22.5 or newer. Open two browser profiles, create two usernames, and message one from the other.
 
+For the admin dashboard, start the server with `ADMIN_BOOTSTRAP_USER` and `ADMIN_BOOTSTRAP_PASSWORD` set (or run `npm run admin -- create you@example.com --role owner`), then open http://localhost:3000/admin.
+
 ## Production
 
 ```bash
@@ -55,7 +64,10 @@ The compose file runs two app instances to show horizontal scaling. Add more by 
 | `TURN_URL`, `TURN_SECRET` | coturn with `use-auth-secret`. Short‑lived TURN credentials are minted per user and never put in the page. |
 | `STUN_URLS` | Override the STUN servers |
 | `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT` | Web Push keys. If unset, they're generated once and stored in the database. |
-| `ADMIN_TOKEN`, `ADMIN_IPS` | Turn on the security dashboard at `/admin`, optionally limited to certain IPs |
+| `ADMIN_BOOTSTRAP_USER`, `ADMIN_BOOTSTRAP_PASSWORD` | First owner admin, created on first start only if no admin exists yet; 2FA is set up at first sign‑in at `/admin`. Put them in `.env`, never in the repo, and use **Change password** in the dashboard after your first sign‑in. |
+| `ADMIN_DATABASE_URL` | Separate Postgres for admin data and analytics (SQLite `admin.db` if unset) |
+| `ADMIN_SECRET_KEY`, `PIN_PEPPER` | Keys kept outside the databases: they encrypt admin 2FA secrets and pepper the PIN‑login checks |
+| `ADMIN_IPS` | Only allow the admin dashboard from these IPs |
 | `SECURITY_WEBHOOK_URL` | Send high‑severity security alerts to Slack, Discord or Teams |
 | `TRUST_PROXY`, `TRUSTED_IP_HEADER`, `ALLOWED_ORIGINS` | Real client IPs behind Caddy or Cloudflare, and allowed WebSocket origins |
 | `REG_PER_IP_HOUR`, `POW_BITS`, `MAX_CONN_PER_IP`, … | Abuse limits. Every one is listed in `server/security.js`. |
@@ -79,7 +91,8 @@ PORT=3100 npm start & python3 tests/e2e.py       # full browser test (Playwright
 ```
 src/shared/      crypto.js (primitives, identities, certs), ratchet.js (PQ double ratchet), envelope.js
 src/client/      app.js (UI), core.js (sessions/network), calls.js, e2ee-worker.js (frame crypto), store.js (encrypted DB), sw.js
-server/          index.js (relay), store.js (SQLite/Postgres), bus.js (local/Redis)
+server/          index.js (relay), store.js (chat DB), admin-store.js (separate admin DB), admin.js + admin-auth.js (dashboard API, 2FA), monitor.js (status), security.js, bus.js
+src/admin/       dashboard UI
 public/          static assets + built bundles
 deploy/          Caddyfile, coturn config
 ```

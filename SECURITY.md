@@ -113,6 +113,25 @@ Messages are end‑to‑end encrypted, so **the server never sees links**. All c
 - "Report" sends only *who* and *why*; message content stays encrypted.
 - Accounts reported by 5 different people within 24 hours are restricted to 10 new conversations per day.
 
+## 4b. PIN login
+
+Users set a 6‑digit PIN at sign‑up and can log in on any new device with **username + PIN**. The recovery key is only needed to recover an account if the PIN is forgotten; after such a recovery, the user sets a new PIN straight away.
+
+A 6‑digit PIN has only a million possibilities, so it's protected the way Signal protects its PINs:
+
+- **Slow to test.** The PIN is stretched with Argon2id (64 MiB of memory, 3 passes) on the device. The result is split into a login check (`auth`) and an encryption key (`enc`).
+- **Neither half alone is enough.** The server stores the account's recovery secrets encrypted with `enc` combined with a random share that the server holds. It releases that share only after a correct PIN.
+- **The server never sees the PIN.** It keeps just a keyed hash of `auth`, `HMAC(PIN_PEPPER, auth)`, and encrypts its share with a key derived from `PIN_PEPPER`. `PIN_PEPPER` is kept outside the database, so **a stolen database alone can't be used to guess PINs offline**.
+- **Guess limits enforced by the server:**
+  - Lockouts grow after the 3rd wrong PIN: 1 minute, then 5 minutes, 15 minutes, 1 hour, 4 hours, 12 hours and 24 hours.
+  - **After 10 wrong PINs the stored backup is erased permanently**, and only the recovery key works.
+  - Each attempt also needs a fresh challenge and a proof‑of‑work puzzle.
+  - One network can make at most 30 PIN attempts per hour, across all accounts.
+- **Owners are alerted** on every wrong PIN (showing how many attempts are left), when PIN login gets erased, and when the PIN is changed or turned off.
+- **Weak PINs are refused**, e.g. 123456, 111111, 121212 or birth years.
+
+**Remaining trust:** whoever runs the server *and* holds `PIN_PEPPER` could try PINs offline. Signal removes that last bit of trust with secure‑enclave hardware; QChat's design is ready for a hardware security module to hold the pepper.
+
 ## 5. Spam and abuse
 
 **Proof‑of‑work at sign‑up and device linking.** Each attempt requires solving a small computing puzzle: about 0.6 seconds in a browser at the default difficulty. The puzzles automatically get harder when many sign‑ups happen at once.
@@ -130,6 +149,63 @@ Messages are end‑to‑end encrypted, so **the server never sees links**. All c
 
 **Shared across servers.** With Redis, all these counters and bans are shared between server instances, so an attacker can't spread out to dodge them.
 
+## 5b. Admin dashboard and separate databases
+
+**Two separate databases**
+- **Chat database:** users, devices, keys, the offline queue, PIN backups and reports.
+- **Admin database:** admin accounts, sessions, the audit trail, user activity, analytics, security events and service‑health history.
+- They are completely separate: two SQLite files, or two separate Postgres servers in `docker-compose.yml`, each with its own volume.
+- Each database belongs to its own **least‑privilege role**: not a superuser, can't create databases or roles, `CONNECT` revoked from everyone else, statement, lock and idle timeouts set, and passwords checked with SCRAM‑SHA‑256.
+- The test suite confirms each role is refused when it tries to connect to the other database.
+
+**SQL injection**
+- Every query uses parameters.
+- Sort orders come from a fixed list, and limits and offsets are forced to numbers.
+- Search wildcards are escaped.
+- Tests send injection payloads and confirm the tables survive intact.
+
+**Admin sign‑in**
+- Each admin has their own account: an email or username, a password hashed with scrypt, plus **TOTP two‑factor authentication** (Google Authenticator, Authy, 1Password …).
+- Codes can't be replayed.
+- 5 failures lock the account for 15 minutes, and logins are rate‑limited per network.
+- Wrong usernames take as long to reject as wrong passwords, so attackers can't tell which accounts exist.
+
+**Sessions**
+- Random 256‑bit token, stored only as a hash.
+- Cookie is `HttpOnly; SameSite=Strict; Secure` (over HTTPS), limited to `/admin`.
+- 30‑minute idle timeout and 8‑hour maximum.
+
+**Cross‑site request forgery (CSRF)**
+- Every API call must carry the custom `X-QChat-Admin` header (another website can't add it) and come from the same origin.
+- Blocked attempts are logged.
+
+**Roles**
+- **viewer:** read‑only.
+- **admin:** manage users and IP bans.
+- **owner:** also deletes accounts, manages admins, and reads the audit log.
+
+**Audit trail**
+- Every admin action is recorded with a hashed IP: viewing a user, suspending, signing users out, removing devices, resetting PINs, deleting accounts, banning IPs, creating admins.
+
+**Secrets at rest**
+- 2FA secrets are encrypted with `ADMIN_SECRET_KEY`, which lives outside the database.
+
+**First owner**
+- Created on first start from `ADMIN_BOOTSTRAP_USER` and `ADMIN_BOOTSTRAP_PASSWORD` in `.env`. The password never goes into the repository.
+- 2FA is set up at the first sign‑in.
+- More admins can be added from the dashboard or with `npm run admin -- create <email> --role admin`.
+
+**What admins can see**
+- Account metadata: profile, devices, sign‑ins, security events, message *counts*, reports.
+- Messages, contacts, group names and membership are end‑to‑end encrypted and never stored on the server, so no admin (and no attacker who takes over an admin account) can read them.
+
+## 5c. Service status and outage detection
+
+- **What's checked:** every ~30 seconds, one elected server checks the app servers, the real‑time relay (a real WebSocket connection), both databases, Redis, the TURN call relay and the push configuration. Every server also reports its own heartbeat.
+- **Incidents:** two failures in a row open an **incident** and send a `service_down` alert to your webhook; recovery closes it.
+- **Admin view:** detailed status with response times, uptime for 24 hours and 30 days, history bars, incidents and server instances.
+- **Public view:** `/status` and the dot on the app's home screen show only up/down per user‑facing service, with no hostnames, IPs or error details.
+
 ## 6. DDoS
 
 | Layer | What it handles |
@@ -146,7 +222,7 @@ Messages are end‑to‑end encrypted, so **the server never sees links**. All c
 The defences above are checked by automated attacks against real server processes:
 
 ```
-npm test   # crypto (13) + link safety (6) + server (3) + security attacks (4)
+npm test   # crypto (13) + link safety (6) + security attacks & PIN login (6) + server (3) + admin (3)
 ```
 
 `tests/security.test.mjs` simulates:
@@ -166,7 +242,8 @@ npm test   # crypto (13) + link safety (6) + server (3) + security attacks (4)
 
 1. Generate every secret in `.env` with `openssl rand -base64 32`.
 2. Put the domain behind Cloudflare or your provider's DDoS protection. Allow only its IP ranges to reach 80/443.
-3. Set `ADMIN_TOKEN` and, ideally, `ADMIN_IPS`. Point `SECURITY_WEBHOOK_URL` at a channel you watch.
-4. Keep the OS, Docker images and npm dependencies updated (`npm audit`, `docker compose pull`).
-5. Back up the Postgres volume. It contains no message content, only public keys and undelivered ciphertext.
-6. Commission an independent penetration test and protocol audit before high‑risk use.
+3. Set `ADMIN_BOOTSTRAP_USER` and `ADMIN_BOOTSTRAP_PASSWORD`, sign in at `/admin` and scan the 2FA QR code. Ideally also set `ADMIN_IPS`. Point `SECURITY_WEBHOOK_URL` at a channel you watch.
+4. Keep `PIN_PEPPER` and `ADMIN_SECRET_KEY` outside the database, e.g. in a secrets manager or KMS, and back them up separately. Losing `PIN_PEPPER` disables PIN login (recovery keys keep working).
+5. Keep the OS, Docker images and npm dependencies updated (`npm audit`, `docker compose pull`).
+6. Back up both Postgres volumes. It contains no message content, only public keys and undelivered ciphertext.
+7. Commission an independent penetration test and protocol audit before high‑risk use.

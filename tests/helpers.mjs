@@ -23,7 +23,7 @@ export class Client {
     this.ws.on('message', (raw) => { const m = JSON.parse(raw); this.inbox.push(m); this.waiters = this.waiters.filter((w) => !w(m)); });
     return new Promise((r) => this.ws.on('open', r));
   }
-  sendRaw(o) { this.ws.send(JSON.stringify(o)); }
+  sendRaw(o) { if (o.t === 'hello') this.lastDevice = o.device; this.ws.send(JSON.stringify(o)); }
   next(pred, ms = 5000) {
     const hit = this.inbox.findIndex(pred); if (hit >= 0) return Promise.resolve(this.inbox.splice(hit, 1)[0]);
     return new Promise((res, rej) => { const t = setTimeout(() => rej(new Error('timeout waiting in ' + this.user)), ms); this.waiters.push((m) => { if (!pred(m)) return false; clearTimeout(t); this.inbox.splice(this.inbox.indexOf(m), 1); res(m); return true; }); });

@@ -17,7 +17,7 @@
       <p class="ob-tag">Connect with anyone in the world using only a username.<br/>No phone number. No email. Post‑quantum end‑to‑end encryption.</p>
       <div class="tabs">
         <button class="tab active" data-tab="create">Create account</button>
-        <button class="tab" data-tab="restore">Log in with recovery key</button>
+        <button class="tab" data-tab="restore">Log in</button>
       </div>
       <form id="createForm" class="ob-form">
         <label>Choose a username<input name="username" autocomplete="off" spellcheck="false" placeholder="e.g. amina.k" required /></label>
@@ -25,14 +25,16 @@
         <button class="btn primary" type="submit">Generate quantum‑safe keys &amp; join</button>
       </form>
       <form id="restoreForm" class="ob-form hidden">
-        <label>Username<input name="username" autocomplete="off" spellcheck="false" required /></label>
-        <label>Recovery key<textarea name="key" rows="3" spellcheck="false" placeholder="Paste the recovery key you saved" required></textarea></label>
+        <label>Username<input name="username" autocomplete="username" spellcheck="false" required /></label>
+        <label id="pinLoginField">6-digit PIN<input name="pin" class="pin-input" type="password" inputmode="numeric" autocomplete="current-password" maxlength="6" pattern="\d{6}" placeholder="••••••" /></label>
+        <label id="keyLoginField" class="hidden">Recovery key<textarea name="key" rows="3" spellcheck="false" placeholder="Paste the recovery key you saved"></textarea></label>
         <button class="btn primary" type="submit">Log in</button>
+        <button class="link" type="button" id="toggleKeyLogin">Forgot your PIN? Recover your account with your recovery key</button>
       </form>
       <p id="obError" class="error"></p>
       <div id="obKey" class="hidden">
         <h3>Save your recovery key</h3>
-        <p class="muted">This key <b>is</b> your account. There is no password and no “forgot password”. Store it somewhere safe — you need it to add a device or restore a backup.</p>
+        <p class="muted">This is how you recover your account if you ever forget your PIN. There is no “forgot password” email — store this key somewhere safe (offline is best). It also unlocks your encrypted backups.</p>
         <pre id="obKeyText" class="keybox"></pre>
         <div class="row">
           <button class="btn" id="obCopy" type="button">Copy</button>
@@ -40,6 +42,15 @@
           <button class="btn primary" id="obContinue" type="button">I saved it — continue</button>
         </div>
       </div>
+      <form id="obPin" class="ob-form hidden">
+        <h3>Create a 6-digit login PIN</h3>
+        <p class="muted">With your username and this PIN you can log back in on any device — no recovery key needed. After 10 wrong attempts PIN login is switched off and only your recovery key works.</p>
+        <label>New PIN<input id="pin1" class="pin-input" type="password" inputmode="numeric" autocomplete="one-time-code" data-lpignore="true" data-1p-ignore maxlength="6" placeholder="••••••" /></label>
+        <label>Repeat PIN<input id="pin2" class="pin-input" type="password" inputmode="numeric" autocomplete="one-time-code" data-lpignore="true" data-1p-ignore maxlength="6" placeholder="••••••" /></label>
+        <p class="error" id="pinErr"></p>
+        <button class="btn primary" type="submit" id="pinSave">Save PIN &amp; open QChat</button>
+      </form>
+      <p class="ob-foot"><a class="status-link" href="/status" target="_blank" rel="noopener"><span class="sdot" id="svcDotOb"></span><span id="svcTextOb">Service status</span></a></p>
       <p class="ob-foot">🔐 Post‑quantum double ratchet · ML‑KEM‑768 + ML‑DSA‑65 (NIST FIPS 203 / 204) · AES‑256‑GCM</p>
     </div>
   </section>
@@ -87,6 +98,7 @@
         <h2>QChat</h2>
         <p>Messages, calls and files are end‑to‑end encrypted with post‑quantum cryptography.<br/>Share your username so people can find you: <b id="welcomeUser"></b></p>
         <button class="btn primary" id="welcomeShare">🔗 Share my link</button>
+        <a class="status-link" href="/status" target="_blank" rel="noopener"><span class="sdot" id="svcDot"></span><span id="svcText">Service status</span></a>
       </div>
 
       <div id="chatView" class="chat-view hidden">

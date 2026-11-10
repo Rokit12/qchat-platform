@@ -4,6 +4,7 @@ import { newSession, needsBundle } from '../shared/ratchet.js';
 import { seal, open } from '../shared/envelope.js';
 import * as db from './store.js';
 import { mutex, deviceName } from './util.js';
+import { pinKeys, sealSeeds, openSeeds } from '../shared/pin.js';
 
 const OTPK_TARGET = 60, OTPK_LOW = 20, SPK_ROTATE = 7 * 864e5, SPK_KEEP = 30 * 864e5, CONTACT_STALE = 10 * 60e3;
 
@@ -148,6 +149,7 @@ async function onServer(m) {
     case 'profile_update': applyUser(m.user); return hooks.onServer(m);
     case 'profile_ok': S.me = { ...S.me, ...m.me }; return hooks.onServer(m);
     case 'kicked': stopped = true; return hooks.onServer(m);
+    case 'pin_ok': pinAck(m); if (S.me) S.me.pinSet = m.enabled; return hooks.onServer(m);
     default: return hooks.onServer(m);
   }
 }
@@ -272,4 +274,59 @@ export async function removeDevice(device) {
   const me = await refreshUser(ME());
   const list = C.makeDeviceList(ME(), me.listVersion + 1, Object.keys(me.devices).filter((d) => d !== device), S.keys.aikSk);
   wsSend({ t: 'devices_update', deviceList: list });
+}
+
+// ---------------------------------------------------------------- PIN login
+/** Store the account seeds on the server, encrypted with the PIN + a server-held share. */
+export async function setPin(pin) {
+  const salt = C.rand(16); const { auth, enc } = await pinKeys(pin, salt); const share = C.rand(32);
+  const seeds = C.concat(C.unb64(S.id.aikSeed), C.unb64(S.id.backupSeed));
+  const blob = await sealSeeds(seeds, enc, share, ME());
+  const res = new Promise((r) => (pinWaiter = r));
+  wsSend({ t: 'pin_set', salt: C.b64(salt), auth: C.b64(auth), share: C.b64(share), blob });
+  return Promise.race([res, new Promise((r) => setTimeout(() => r(null), 15000))]);
+}
+export function clearPin() { const res = new Promise((r) => (pinWaiter = r)); wsSend({ t: 'pin_clear' }); return res; }
+let pinWaiter = null;
+export function pinAck(m) { if (pinWaiter) { const w = pinWaiter; pinWaiter = null; w(m); } }
+
+/**
+ * Recover account seeds on a new device with username + PIN (no recovery key).
+ * Uses a short-lived connection; on success returns {aikSeed, backupSeed}. Throws Error with
+ * .info = {attemptsLeft, lockedFor, wiped} on failure.
+ */
+export async function pinRecover(user, pin, onStep = () => {}) {
+  const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host);
+  const inbox = []; let waiter = null;
+  ws.onmessage = (e) => { const m = JSON.parse(e.data); if (waiter && waiter.pred(m)) { const w = waiter; waiter = null; w.res(m); } else inbox.push(m); };
+  const next = (pred, ms = 20000) => new Promise((res, rej) => {
+    const i = inbox.findIndex(pred); if (i >= 0) return res(inbox.splice(i, 1)[0]);
+    waiter = { pred, res }; setTimeout(() => rej(new Error('Server did not respond — check your connection')), ms);
+  });
+  const err = (msg, info = {}) => Object.assign(new Error(msg), { info });
+  try {
+    await new Promise((res, rej) => { ws.onopen = res; ws.onerror = () => rej(new Error('Cannot reach the server')); });
+    ws.send(JSON.stringify({ t: 'pin_params', user, rid: 1 }));
+    const params = await next((m) => m.t === 'pin_params');
+    if (!params.enabled) throw err(params.error === 'rate_limited' ? 'Too many tries — wait a few minutes' : 'PIN login isn’t set up for this account (or was disabled after too many wrong PINs). Use your recovery key.');
+    if (params.lockedFor > 0) throw err(`Too many wrong PINs. Try again in ${Math.ceil(params.lockedFor / 60000)} min.`, params);
+    onStep('Checking your PIN…');
+    const salt = C.unb64(params.salt); const { auth, enc } = await pinKeys(pin, salt);
+    const tmpDev = C.randId(8);
+    ws.send(JSON.stringify({ t: 'hello', user, device: tmpDev }));
+    const ch = await next((m) => m.t === 'challenge' || m.t === 'auth_error');
+    if (ch.t === 'auth_error') throw err(ch.error);
+    onStep('Solving anti-abuse puzzle…');
+    const pow = await C.solvePow(ch.nonce, user, tmpDev, ch.pow);
+    ws.send(JSON.stringify({ t: 'pin_unlock', auth: C.b64(auth), pow }));
+    const r = await next((m) => m.t === 'pin_result');
+    if (!r.ok) {
+      if (r.error === 'wiped') throw err('Too many wrong PINs — PIN login has been disabled for this account. Use your recovery key.', { wiped: true });
+      if (r.error === 'wrong') throw err(`Wrong PIN. ${r.attemptsLeft} attempt${r.attemptsLeft === 1 ? '' : 's'} left before PIN login is disabled${r.lockedFor ? `; try again in ${Math.ceil(r.lockedFor / 60000)} min` : ''}.`, r);
+      if (r.error === 'locked') throw err(`Too many wrong PINs. Try again in ${Math.ceil(r.lockedFor / 60000)} min.`, r);
+      throw err(r.error, r);
+    }
+    const seeds = await openSeeds(r.blob, enc, C.unb64(r.share), user);
+    return { aikSeed: seeds.slice(0, 32), backupSeed: seeds.slice(32, 96) };
+  } finally { try { ws.close(); } catch {} }
 }

@@ -7,6 +7,7 @@ import * as live from './live.js';
 import qrcode from 'qrcode-generator';
 import { analyzeUrl, analyzeMessage, analyzeFile, containsRecoveryKey, URL_RE } from '../shared/linksafety.js';
 import { cleanText, looksLikeImpersonation } from '../shared/policy.js';
+import { weakPin, PIN_RE } from '../shared/pin.js';
 import * as C from '../shared/crypto.js';
 import { $, $$, esc, clamp, clip, hashColor, nameColor, fmtTime, fmtDay, fmtListTime, fmtSize, fmtDur, fmtAgo, toast, mutex } from './util.js';
 
@@ -301,6 +302,7 @@ hooks.onServer = (m) => {
     case 'security_alerts': onSecurityAlerts(m.alerts, true); break;
     case 'error': if (m.error === 'display_name_not_allowed') toast('That display name looks like an official account — please choose another.', 5000); break;
     case 'report_ok': break;
+    case 'pin_ok': renderMe(); break;
   }
 };
 // ---------- account security alerts pushed by the server's intrusion detection ----------
@@ -309,6 +311,10 @@ const ALERT_TEXT = {
   account_locked: () => 'Your account was locked for 15 minutes after repeated takeover attempts. Your recovery key was never exposed.',
   device_linked: (a) => `A new device was linked to your account: ${a.detail?.name || 'unknown device'}. If this wasn't you, remove it in Settings → Linked devices.`,
   bad_device_signature: () => 'A forged login for your account was blocked.',
+  pin_failed: (a) => `Someone entered a WRONG login PIN for your account (${a.detail?.left} attempt${a.detail?.left === 1 ? '' : 's'} left before PIN login is disabled). If this wasn't you, change your PIN in Settings.`,
+  pin_wiped: () => 'PIN login was disabled after 10 wrong PINs. Your account is safe — set a new PIN in Settings (your recovery key still works).',
+  pin_changed: () => 'Your login PIN was changed on another device. If this wasn\'t you, change it now and review your linked devices.',
+  pin_removed: () => 'PIN login was turned off on another device.',
 };
 async function onSecurityAlerts(list, quiet) {
   const seen = new Set((await db.get('secAlertIds')) || []); let fresh = 0;
@@ -346,6 +352,7 @@ hooks.onReady = () => {
   core.wsSend({ t: 'watch', users: [...watch] });
   for (const u of watch) if (!K.contacts[u] || Date.now() - (K.contacts[u].fetched || 0) > 10 * 60e3) core.refreshUser(u);
   if (A.settings.pushWanted && !K.pushOn) enablePush(true);
+  if (K.me && K.me.pinSet === false && !A.pinNudged && $('#modal').classList.contains('hidden') && !$('#app').classList.contains('hidden')) { A.pinNudged = true; setTimeout(() => $('#modal').classList.contains('hidden') && pinDialog(true), 1500); }
 };
 function setBanner(on) { $('#connBanner').classList.toggle('hidden', !on || !K.me); }
 
@@ -943,6 +950,7 @@ function settingsDialog() {
     ${A.hasPasscode ? `<div class="switch"><span>Auto-lock after</span><select id="sAutoLock">${[[0, 'Never'], [1, '1 minute'], [5, '5 minutes'], [15, '15 minutes'], [60, '1 hour']].map(([v, l]) => `<option value="${v}" ${v === A.settings.autoLock ? 'selected' : ''}>${l}</option>`).join('')}</select></div>` : ''}
     <div class="field"><span>Linked devices (${devs.length}/5)</span><ul class="list" id="sDevices">${devs.map((d) => `<li><span class="fi">${/Android|iOS/.test(d.name) ? '📱' : '💻'}</span><div class="grow"><b>${esc(d.name || 'Device')}</b><small>${d.current ? 'This device' : 'Added ' + fmtDay(d.created)} · ${esc(d.device.slice(0, 8))}</small></div>${d.current ? '' : `<button class="btn danger" data-rmdev="${esc(d.device)}">Remove</button>`}</li>`).join('')}</ul>
       <small class="muted">To add a device, open QChat there and log in with your username + recovery key. Your chat history can be copied from this device.</small></div>
+    <div class="switch"><span>Login PIN${K.me?.pinSet ? ' ✅' : ' ⚠️ not set'}<small class="muted block">Log in on any device with your username + 6-digit PIN. 10 wrong tries disable it.</small></span><span class="row">${K.me?.pinSet ? '<button class="btn" id="sPinChange">Change</button><button class="btn danger" id="sPinOff">Turn off</button>' : '<button class="btn primary" id="sPinChange">Set up PIN</button>'}</span></div>
     <div class="row"><button class="btn" id="sShowKey">Show recovery key</button></div>
     <div class="field"><span>Security activity</span><ul class="list sec-list">${(A.secAlerts || []).slice(0, 8).map((a) => `<li><span class="fi">🛡️</span><div class="grow">${esc(a.text)}<small>${fmtAgo(a.ts)}</small></div></li>`).join('') || '<li class="muted">No suspicious activity detected.</li>'}</ul></div>
     <div class="section-title">Backup</div>
@@ -966,6 +974,8 @@ function settingsDialog() {
       if (!(await confirmDialog('Remove device?', 'That device will be logged out and its local data becomes unreadable to the account.', 'Remove', true))) return settingsDialog();
       await core.removeDevice(b.dataset.rmdev); closeModal(); toast('Device removed and signed out'); setTimeout(() => core.refreshUser(ME()), 600);
     };
+    $('#sPinChange', card).onclick = () => pinDialog();
+    $('#sPinOff', card) && ($('#sPinOff', card).onclick = async () => { if (!(await confirmDialog('Turn off PIN login?', 'You will need your recovery key to log in on new devices.', 'Turn off', true))) return; await core.clearPin(); toast('PIN login turned off'); });
     $('#sShowKey', card).onclick = async () => {
       if (!(await confirmDialog('Show recovery key?', 'Anyone who sees it can take over your account.', 'Show'))) return;
       openModal(`<h3>Recovery key</h3><p class="muted">Use with your username to log in on a new device or restore a backup.</p><pre class="keybox">${esc(core.recoveryKey())}</pre><div class="modal-actions"><button class="btn primary" data-close>Done</button></div>`);
@@ -980,6 +990,24 @@ function settingsDialog() {
       const wantN = $('#sNotif', card).checked;
       if (wantN && 'Notification' in window && Notification.permission !== 'granted') await Notification.requestPermission();
       A.settings.notifications = wantN; persist('settings'); closeModal(); toast('Saved');
+    };
+  });
+}
+function pinDialog(nudge) {
+  openModal(`<h3>${K.me?.pinSet ? 'Change your login PIN' : '🔑 Set up a login PIN'}</h3>
+    <p class="muted small">${nudge ? 'You don\'t have a login PIN yet. ' : ''}With your username and a 6-digit PIN you can log back in on any device without your recovery key. Your other devices are alerted whenever the PIN is used wrongly or changed.</p>
+    <div class="field"><span>New PIN</span><input id="pd1" class="pin-input" type="password" inputmode="numeric" maxlength="6" autocomplete="one-time-code" data-lpignore="true" data-1p-ignore/></div>
+    <div class="field"><span>Repeat PIN</span><input id="pd2" class="pin-input" type="password" inputmode="numeric" maxlength="6" autocomplete="one-time-code" data-lpignore="true" data-1p-ignore/></div>
+    <p class="error" id="pdErr"></p>
+    <div class="modal-actions"><button class="btn" data-close>${nudge ? 'Later' : 'Cancel'}</button><button class="btn primary" id="pdSave">Save PIN</button></div>`, (card) => {
+    $('#pdSave', card).onclick = async () => {
+      const a = $('#pd1', card).value.trim(), b = $('#pd2', card).value.trim();
+      const weak = weakPin(a); if (weak) return ($('#pdErr', card).textContent = weak);
+      if (a !== b) return ($('#pdErr', card).textContent = "PINs don't match");
+      $('#pdSave', card).disabled = true; $('#pdErr', card).textContent = 'Securing your PIN…';
+      const r = await core.setPin(a).catch(() => null);
+      if (!r?.enabled) { $('#pdSave', card).disabled = false; return ($('#pdErr', card).textContent = 'Could not save — try again.'); }
+      closeModal(); toast('Login PIN saved ✅');
     };
   });
 }
@@ -1422,23 +1450,62 @@ $('#createForm').onsubmit = async (e) => {
   $('#createForm').classList.add('hidden'); $('.tabs').classList.add('hidden');
   $('#obKey').classList.remove('hidden'); $('#obKeyText').textContent = recoveryShown;
 };
+$('#toggleKeyLogin').onclick = () => {
+  const useKey = $('#keyLoginField').classList.toggle('hidden') === false;
+  $('#pinLoginField').classList.toggle('hidden', useKey);
+  $('#toggleKeyLogin').textContent = useKey ? 'Remember your PIN? Log in with it instead' : 'Forgot your PIN? Recover your account with your recovery key';
+  $('#obError').textContent = '';
+};
 $('#restoreForm').onsubmit = async (e) => {
   e.preventDefault(); $('#obError').textContent = '';
   const f = e.target; const user = f.username.value.trim().toLowerCase().replace(/^@/, '');
-  let seeds; try { seeds = C.parseRecoveryKey(f.key.value); } catch (err) { return ($('#obError').textContent = err.message); }
-  setObBusy(true); $('#obError').textContent = 'Verifying recovery key…';
+  if (!/^[a-z0-9_.]{3,24}$/.test(user)) return ($('#obError').textContent = 'Enter your username');
+  const useKey = !$('#keyLoginField').classList.contains('hidden');
+  let seeds;
+  if (useKey) { try { seeds = C.parseRecoveryKey(f.key.value); } catch (err) { return ($('#obError').textContent = err.message); } }
+  else {
+    const pin = f.pin.value.trim();
+    if (!PIN_RE.test(pin)) return ($('#obError').textContent = 'Enter your 6-digit PIN');
+    setObBusy(true); $('#obError').textContent = 'Checking your PIN…';
+    try { seeds = await core.pinRecover(user, pin, (t) => ($('#obError').textContent = t)); }
+    catch (err) { setObBusy(false); f.pin.value = ''; $('#obError').textContent = err.message; if (err.info?.wiped) $('#toggleKeyLogin').click(); return; }
+  }
+  setObBusy(true); $('#obError').textContent = useKey ? 'Verifying recovery key…' : 'PIN correct — linking this device…';
   const ok = await beginEnroll(core.newIdentity(user, seeds), { register: false, confirmReplace: () => confirmDialog('Too many devices', 'You already have 5 linked devices. Logging in here will remove your oldest device.', 'Continue', true) });
   if (!ok) return;
-  await afterLogin();
-  core.sendPayload([], { type: 'sync_req', name: K.id.dev.name }); // ask my other devices for history
-  toast('Logged in. If another of your devices is online, approve the history copy there.', 6000);
+  const finish = () => {
+    core.sendPayload([], { type: 'sync_req', name: K.id.dev.name }); // ask my other devices for history
+    toast('Logged in. If another of your devices is online, approve the history copy there.', 6000);
+  };
+  if (useKey) { // account recovered with the recovery key (PIN forgotten) → choose a new PIN first
+    setObBusy(false); $('#obError').textContent = '';
+    $('#restoreForm').classList.add('hidden'); $('.tabs').classList.add('hidden');
+    $('#obPin h3').textContent = 'Account recovered — set a new login PIN';
+    $('#obPin p.muted').textContent = 'Your recovery key worked. Choose a new 6-digit PIN for logging in from now on; it replaces any PIN you forgot.';
+    $('#obPin').classList.remove('hidden'); $('#pin1').focus();
+    afterPinStep = finish; return;
+  }
+  await afterLogin(); finish();
 };
+let afterPinStep = null;
 $('#obCopy').onclick = () => navigator.clipboard?.writeText(recoveryShown).then(() => toast('Copied'));
 $('#obDownload').onclick = () => {
   const blob = new Blob([`QChat recovery key\nUsername: ${ME()}\n\n${recoveryShown}\n\nKeep this secret. Anyone with it can log in as you.\n`], { type: 'text/plain' });
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `qchat-recovery-${ME()}.txt`; a.click();
 };
-$('#obContinue').onclick = () => { recoveryShown = null; afterLogin(); };
+$('#obContinue').onclick = () => { recoveryShown = null; $('#obKey').classList.add('hidden'); $('#obPin').classList.remove('hidden'); $('#pin1').focus(); };
+$('#obPin').onsubmit = async (e) => {
+  e.preventDefault();
+  const a = $('#pin1').value.trim(), b = $('#pin2').value.trim();
+  const weak = weakPin(a); if (weak) return ($('#pinErr').textContent = weak);
+  if (a !== b) return ($('#pinErr').textContent = "PINs don't match");
+  $('#pinSave').disabled = true; $('#pinErr').textContent = 'Securing your PIN…';
+  const r = await core.setPin(a).catch(() => null);
+  $('#pinSave').disabled = false;
+  if (!r?.enabled) return ($('#pinErr').textContent = 'Could not save your PIN — check your connection and try again.');
+  $('#pinErr').textContent = ''; await afterLogin();
+  if (afterPinStep) { const f = afterPinStep; afterPinStep = null; f(); }
+};
 
 async function loadAppState() {
   A.chats = (await db.get('chats')) || {};
@@ -1481,6 +1548,16 @@ $('#lockForm').onsubmit = async (e) => {
 };
 $('#lockForget').onclick = async () => { if (await confirmDialog('Reset this device?', 'All local data will be erased. Log back in with your username + recovery key, then restore a backup or copy history from another device.', 'Erase & reset', true)) wipeAndReload(); };
 
+// live service status on the home screen
+async function loadServiceStatus() {
+  if (window.__QCHAT_PREVIEW) { $$('.status-link').forEach((x) => x.classList.add('hidden')); return; }
+  try {
+    const st = await (await fetch('/api/status', { cache: 'no-store' })).json();
+    const txt = { operational: 'All systems operational', degraded: 'Some services degraded', major_outage: 'Service outage' }[st.overall] || 'Service status';
+    for (const [d, t] of [['#svcDot', '#svcText'], ['#svcDotOb', '#svcTextOb']]) { $(d).className = 'sdot ' + st.overall; $(t).textContent = txt; }
+  } catch { for (const t of ['#svcText', '#svcTextOb']) $(t).textContent = 'Service status unavailable'; for (const d of ['#svcDot', '#svcDotOb']) $(d).className = 'sdot major_outage'; }
+}
+loadServiceStatus(); setInterval(loadServiceStatus, 60000);
 try { navigator.serviceWorker?.addEventListener('message', (e) => { if (e.data?.op === 'open' && e.data.from && A.chats['dm:' + e.data.from]) openChat('dm:' + e.data.from); }); } catch {}
 window.addEventListener('beforeunload', () => { flushPersist(); });
 

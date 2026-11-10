@@ -13,12 +13,14 @@ CREATE TABLE IF NOT EXISTS queue (seq ${serial}, username TEXT NOT NULL, device 
 CREATE INDEX IF NOT EXISTS queue_dev ON queue (username, device, seq);
 CREATE INDEX IF NOT EXISTS queue_ts ON queue (ts);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value ${text} NOT NULL);
-CREATE TABLE IF NOT EXISTS security_events (seq ${serial}, ts ${big} NOT NULL, type TEXT NOT NULL, severity TEXT NOT NULL, username TEXT, ip_hash TEXT, detail ${text});
-CREATE INDEX IF NOT EXISTS sec_ts ON security_events (ts);
-CREATE INDEX IF NOT EXISTS sec_user ON security_events (username, ts);
+CREATE TABLE IF NOT EXISTS pin_recovery (username TEXT PRIMARY KEY, salt TEXT NOT NULL, verifier TEXT NOT NULL, share ${text} NOT NULL, blob ${text} NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0, locked_until ${big} NOT NULL DEFAULT 0, updated ${big} NOT NULL);
 CREATE TABLE IF NOT EXISTS reports (reporter TEXT NOT NULL, target TEXT NOT NULL, reason TEXT, ts ${big} NOT NULL, PRIMARY KEY (reporter, target));`;
 
-const rowUser = (r) => r && ({ username: r.username, aik: r.aik, deviceList: JSON.parse(r.device_list), profile: JSON.parse(r.profile), hideLastSeen: !!r.hide_last_seen, lastSeen: r.last_seen == null ? null : Number(r.last_seen), createdAt: Number(r.created_at) });
+const rowUser = (r) => r && ({ username: r.username, aik: r.aik, deviceList: JSON.parse(r.device_list), profile: JSON.parse(r.profile), hideLastSeen: !!r.hide_last_seen, lastSeen: r.last_seen == null ? null : Number(r.last_seen), createdAt: Number(r.created_at), suspendedUntil: Number(r.suspended_until || 0), suspendReason: r.suspend_reason || '' });
+// additive migrations for databases created by older versions (errors = already applied)
+const MIGRATIONS = (big) => [`ALTER TABLE users ADD COLUMN suspended_until ${big} NOT NULL DEFAULT 0`, 'ALTER TABLE users ADD COLUMN suspend_reason TEXT'];
+const SORTS = { created: 'created_at DESC', created_asc: 'created_at ASC', seen: 'last_seen DESC', name: 'username ASC' }; // whitelist: never interpolate user input into SQL
 const rowDev = (r) => ({ device: r.device, cert: JSON.parse(r.cert), spk: JSON.parse(r.spk), push: r.push ? JSON.parse(r.push) : null });
 
 // Minimal async interface shared by both backends: q(sql, params) -> rows, run(sql, params), tx(fn)
@@ -40,7 +42,7 @@ function api(db) {
       vals.push(u); await db.run(`UPDATE users SET ${sets.join(',')} WHERE username=$${vals.length}`, vals);
     },
     async deleteUser(u) {
-      await db.tx(async (t) => { for (const tb of ['otpks', 'devices', 'queue', 'users']) await t.run(`DELETE FROM ${tb} WHERE username=$1`, [u]); await t.run('DELETE FROM reports WHERE reporter=$1 OR target=$1', [u]); });
+      await db.tx(async (t) => { for (const tb of ['otpks', 'devices', 'queue', 'users', 'pin_recovery']) await t.run(`DELETE FROM ${tb} WHERE username=$1`, [u]); await t.run('DELETE FROM reports WHERE reporter=$1 OR target=$1', [u]); });
     },
     async getDevices(u) { return (await db.q('SELECT * FROM devices WHERE username=$1 ORDER BY created_at', [u])).map(rowDev); },
     async getDevice(u, d) { const r = (await db.q('SELECT * FROM devices WHERE username=$1 AND device=$2', [u, d]))[0]; return r ? rowDev(r) : null; },
@@ -69,18 +71,53 @@ function api(db) {
     },
     async queueStats() { return (await db.q('SELECT COUNT(*) AS n FROM queue'))[0]; },
     async purgeQueue(olderThan) { await db.run('DELETE FROM queue WHERE ts < $1', [olderThan]); },
-    async addSecurityEvent(e) { await db.run('INSERT INTO security_events (ts, type, severity, username, ip_hash, detail) VALUES ($1,$2,$3,$4,$5,$6)', [e.ts, e.type, e.severity, e.username, e.ipHash, JSON.stringify(e.detail || {})]); },
-    async listSecurityEvents({ since = 0, username, limit = 200, minSeverity } = {}) {
-      const sev = ['info', 'low', 'medium', 'high', 'critical']; const allowed = minSeverity ? sev.slice(sev.indexOf(minSeverity)) : sev;
-      const vals = [since, ...allowed]; let sql = `SELECT * FROM security_events WHERE ts >= $1 AND severity IN (${allowed.map((_, i) => '$' + (i + 2)).join(',')})`;
-      if (username) { vals.push(username); sql += ` AND username = $${vals.length}`; }
-      sql += ' ORDER BY seq DESC LIMIT ' + Math.min(Number(limit) || 200, 1000);
-      return (await db.q(sql, vals)).map((r) => ({ id: Number(r.seq), ts: Number(r.ts), type: r.type, severity: r.severity, username: r.username, ipHash: r.ip_hash, detail: JSON.parse(r.detail || '{}') }));
+    async getPin(u) { const r = (await db.q('SELECT * FROM pin_recovery WHERE username=$1', [u]))[0]; return r ? { salt: r.salt, verifier: r.verifier, share: r.share, blob: JSON.parse(r.blob), attempts: Number(r.attempts), lockedUntil: Number(r.locked_until) } : null; },
+    async setPin(u, p) {
+      await db.run('INSERT INTO pin_recovery (username, salt, verifier, share, blob, attempts, locked_until, updated) VALUES ($1,$2,$3,$4,$5,0,0,$6) ON CONFLICT (username) DO UPDATE SET salt=excluded.salt, verifier=excluded.verifier, share=excluded.share, blob=excluded.blob, attempts=0, locked_until=0, updated=excluded.updated',
+        [u, p.salt, p.verifier, p.share, JSON.stringify(p.blob), Date.now()]);
     },
-    async purgeSecurityEvents(olderThan) { await db.run('DELETE FROM security_events WHERE ts < $1', [olderThan]); },
+    async deletePin(u) { await db.run('DELETE FROM pin_recovery WHERE username=$1', [u]); },
+    async pinFailed(u, lockFor) { // atomic increment so parallel guesses on several servers can't skip the counter
+      const rows = await db.q('UPDATE pin_recovery SET attempts = attempts + 1 WHERE username=$1 RETURNING attempts', [u]);
+      const n = rows[0] ? Number(rows[0].attempts) : 0;
+      const until = lockFor(n); if (until) await db.run('UPDATE pin_recovery SET locked_until=$1 WHERE username=$2', [Date.now() + until, u]);
+      return n;
+    },
+    async pinSucceeded(u) { await db.run('UPDATE pin_recovery SET attempts=0, locked_until=0 WHERE username=$1', [u]); },
     async addReport(reporter, target, reason) { await db.run('INSERT INTO reports (reporter, target, reason, ts) VALUES ($1,$2,$3,$4) ON CONFLICT (reporter, target) DO UPDATE SET reason=excluded.reason, ts=excluded.ts', [reporter, target, reason, Date.now()]); },
     async countReports(target, since) { return Number((await db.q('SELECT COUNT(*) AS n FROM reports WHERE target=$1 AND ts >= $2', [target, since]))[0].n); },
     async queueCount(u, d) { return Number((await db.q('SELECT COUNT(*) AS n FROM queue WHERE username=$1 AND device=$2', [u, d]))[0].n); },
+    async ping() { const t = Date.now(); await db.q('SELECT 1 AS ok'); return Date.now() - t; },
+    async setSuspension(u, until, reason) { await db.run('UPDATE users SET suspended_until=$1, suspend_reason=$2 WHERE username=$3', [until, reason || null, u]); },
+    async listUsers({ q = '', status = '', sort = 'created', limit = 50, offset = 0 } = {}) {
+      const vals = [], where = [];
+      if (q) { vals.push('%' + String(q).toLowerCase().replace(/[\\%_]/g, (c) => '\\' + c) + '%'); where.push(`(username LIKE $${vals.length} ESCAPE '\\' OR LOWER(profile) LIKE $${vals.length} ESCAPE '\\')`); }
+      if (status === 'suspended') { vals.push(Date.now()); where.push(`suspended_until > $${vals.length}`); }
+      if (status === 'active') { vals.push(Date.now()); where.push(`suspended_until <= $${vals.length}`); }
+      const w = where.length ? 'WHERE ' + where.join(' AND ') : '';
+      const total = Number((await db.q(`SELECT COUNT(*) AS n FROM users ${w}`, vals))[0].n);
+      const rows = await db.q(`SELECT * FROM users ${w} ORDER BY ${SORTS[sort] || SORTS.created} LIMIT ${Math.min(Math.max(Number(limit) || 50, 1), 200)} OFFSET ${Math.max(Number(offset) || 0, 0)}`, vals);
+      return { total, users: rows.map(rowUser) };
+    },
+    async countsFor(usernames) { // devices, PIN and reports for a page of users
+      if (!usernames.length) return {};
+      const ph = usernames.map((_, i) => '$' + (i + 1)).join(',');
+      const out = Object.fromEntries(usernames.map((u) => [u, { devices: 0, pin: false, reports: 0 }]));
+      for (const r of await db.q(`SELECT username, COUNT(*) AS n FROM devices WHERE username IN (${ph}) GROUP BY username`, usernames)) out[r.username].devices = Number(r.n);
+      for (const r of await db.q(`SELECT username FROM pin_recovery WHERE username IN (${ph})`, usernames)) out[r.username].pin = true;
+      for (const r of await db.q(`SELECT target, COUNT(*) AS n FROM reports WHERE target IN (${ph}) GROUP BY target`, usernames)) out[r.target].reports = Number(r.n);
+      return out;
+    },
+    async listReports(target) { return (await db.q('SELECT reporter, reason, ts FROM reports WHERE target=$1 ORDER BY ts DESC LIMIT 100', [target])).map((r) => ({ reporter: r.reporter, reason: r.reason, ts: Number(r.ts) })); },
+    async clearReports(target) { await db.run('DELETE FROM reports WHERE target=$1', [target]); },
+    async totals() {
+      const one = async (sql, p = []) => Number((await db.q(sql, p))[0].n);
+      return { users: await one('SELECT COUNT(*) AS n FROM users'), devices: await one('SELECT COUNT(*) AS n FROM devices'), pinUsers: await one('SELECT COUNT(*) AS n FROM pin_recovery'),
+        suspended: await one('SELECT COUNT(*) AS n FROM users WHERE suspended_until > $1', [Date.now()]), queued: await one('SELECT COUNT(*) AS n FROM queue'),
+        new24h: await one('SELECT COUNT(*) AS n FROM users WHERE created_at > $1', [Date.now() - 864e5]), new7d: await one('SELECT COUNT(*) AS n FROM users WHERE created_at > $1', [Date.now() - 7 * 864e5]) };
+    },
+    async userCreatedSince(ts) { return (await db.q('SELECT created_at FROM users WHERE created_at > $1', [ts])).map((r) => Number(r.created_at)); },
+    async deviceNames() { return (await db.q('SELECT cert FROM devices')).map((r) => { try { return JSON.parse(r.cert).name || ''; } catch { return ''; } }); },
     async getMeta(k) { const r = (await db.q('SELECT value FROM meta WHERE key=$1', [k]))[0]; return r ? JSON.parse(r.value) : null; },
     async initMeta(k, v) { // first writer wins (safe when many instances start together)
       await db.run('INSERT INTO meta (key, value) VALUES ($1,$2) ON CONFLICT (key) DO NOTHING', [k, JSON.stringify(v)]);
@@ -91,12 +128,13 @@ function api(db) {
   };
 }
 
-async function sqlite(file) {
+export async function sqlite(file, schema = SCHEMA, migrations = MIGRATIONS) {
   const { DatabaseSync } = await import('node:sqlite');
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const d = new DatabaseSync(file);
   d.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=OFF;');
-  d.exec(SCHEMA('INTEGER PRIMARY KEY AUTOINCREMENT'));
+  d.exec(schema('INTEGER PRIMARY KEY AUTOINCREMENT'));
+  for (const m of migrations('INTEGER')) { try { d.exec(m); } catch {} }
   const conv = (sql) => sql.replace(/\$(\d+)/g, '?$1');
   const cache = new Map();
   const st = (sql) => { let s = cache.get(sql); if (!s) { s = d.prepare(conv(sql)); cache.set(sql, s); } return s; };
@@ -111,13 +149,15 @@ async function sqlite(file) {
   return db;
 }
 
-async function postgres(url) {
+export async function postgres(url, schema = SCHEMA, migrations = MIGRATIONS, lockId = 727274001) {
   const { default: pg } = await import('pg');
   const pool = new pg.Pool({ connectionString: url, max: Number(process.env.PG_POOL || 10) });
   { // several instances may boot at once: serialize schema creation with an advisory lock
     const c = await pool.connect();
-    try { await c.query('SELECT pg_advisory_lock(727274001)'); await c.query(SCHEMA('BIGSERIAL PRIMARY KEY')); }
-    finally { await c.query('SELECT pg_advisory_unlock(727274001)').catch(() => {}); c.release(); }
+    try {
+      await c.query('SELECT pg_advisory_lock($1)', [lockId]); await c.query(schema('BIGSERIAL PRIMARY KEY'));
+      for (const m of migrations('BIGINT')) await c.query(m.replace('ADD COLUMN', 'ADD COLUMN IF NOT EXISTS'));
+    } finally { await c.query('SELECT pg_advisory_unlock($1)', [lockId]).catch(() => {}); c.release(); }
   }
   const db = {
     kind: 'postgres',

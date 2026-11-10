@@ -6,4 +6,5 @@ dump.rdb
 public/app.js
 public/sw.js
 public/e2ee-worker.js
+public/admin.js
 preview/

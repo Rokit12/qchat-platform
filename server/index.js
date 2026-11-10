@@ -1,5 +1,6 @@
 // QChat server v2 — a relay that never sees message contents.
 // Multi-device accounts, signed device lists, PQ prekeys, offline queue, Web Push, horizontal scaling.
+import './env.js';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -11,6 +12,9 @@ import { openStore } from './store.js';
 import { openBus } from './bus.js';
 import { dsaVerify, verifyCert, verifyDeviceList, verifyPrekey, unb64, AUTH_DOMAIN, ENROLL_DOMAIN } from '../src/shared/crypto.js';
 import { createSecurity, clientIp, timingSafeEqual, LIMITS } from './security.js';
+import { openAdminStore, day } from './admin-store.js';
+import { createAdmin } from './admin.js';
+import { createMonitor } from './monitor.js';
 import { isReservedUsername, cleanText, looksLikeImpersonation } from '../src/shared/policy.js';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -20,7 +24,7 @@ const MAX_PAYLOAD = 24 * 1024 * 1024;
 const PREAUTH_MAX = 600 * 1024;        // max frame size before a socket has authenticated
 const AUTH_TIMEOUT = Number(process.env.AUTH_TIMEOUT_MS || 20000); // unauthenticated sockets are closed after 20 s
 const MAX_QUEUE_PER_DEVICE = 5000;
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
+const INSTANCE_ID = crypto.randomBytes(6).toString('hex');
 const QUEUE_TTL = 30 * 864e5;
 const MAX_DEVICES = 5;
 const USERNAME_RE = /^[a-z0-9_.]{3,24}$/;
@@ -28,12 +32,33 @@ const DEVICE_RE = /^[0-9a-f]{16}$/;
 const DSA_PK = 1952, KEM_PK = 1184;
 
 const store = await openStore({ databaseUrl: process.env.DATABASE_URL, dataDir: process.env.DATA_DIR || path.join(ROOT, 'data') });
+// Independent admin/analytics database: separate file (SQLite) or separate server & credentials (ADMIN_DATABASE_URL)
+const adminStore = await openAdminStore({ adminDatabaseUrl: process.env.ADMIN_DATABASE_URL, dataDir: process.env.DATA_DIR || path.join(ROOT, 'data') });
 const bus = openBus(process.env.REDIS_URL);
+
+// ---------- PIN login secrets ----------
+// PIN_PEPPER never lives in the database: a stolen DB can't be used to brute-force PINs offline.
+let pinPepper = process.env.PIN_PEPPER ? Buffer.from(process.env.PIN_PEPPER, 'utf8') : null;
+if (!pinPepper) {
+  pinPepper = Buffer.from(await store.initMeta('pin_pepper', crypto.randomBytes(32).toString('base64')), 'base64');
+  console.warn('⚠️  PIN_PEPPER is not set — using a key stored in the database. Set PIN_PEPPER (openssl rand -base64 32) in production.');
+}
+const pinVerifier = (auth) => crypto.createHmac('sha256', pinPepper).update('qchat-pin-verifier|' + auth).digest('base64');
+const shareKey = Buffer.from(crypto.hkdfSync('sha256', pinPepper, 'qchat', 'qchat-pin-share-v1', 32));
+function encShare(shareB64, user) {
+  const iv = crypto.randomBytes(12), c = crypto.createCipheriv('aes-256-gcm', shareKey, iv); c.setAAD(Buffer.from(user));
+  return Buffer.concat([iv, c.update(Buffer.from(shareB64, 'base64')), c.final(), c.getAuthTag()]).toString('base64');
+}
+function decShare(enc, user) {
+  const b = Buffer.from(enc, 'base64'), d = crypto.createDecipheriv('aes-256-gcm', shareKey, b.subarray(0, 12)); d.setAAD(Buffer.from(user)); d.setAuthTag(b.subarray(b.length - 16));
+  return Buffer.concat([d.update(b.subarray(12, b.length - 16)), d.final()]).toString('base64');
+}
 
 // ---------- Web Push (VAPID) ----------
 let vapid = process.env.VAPID_PUBLIC_KEY ? { publicKey: process.env.VAPID_PUBLIC_KEY, privateKey: process.env.VAPID_PRIVATE_KEY } : await store.getMeta('vapid');
 if (!vapid) vapid = await store.initMeta('vapid', webpush.generateVAPIDKeys());
-webpush.setVapidDetails(process.env.VAPID_SUBJECT || 'mailto:admin@example.com', vapid.publicKey, vapid.privateKey);
+// Push services want a contact for the sender: use the site URL (no email address is ever sent to them).
+webpush.setVapidDetails(process.env.VAPID_SUBJECT || (process.env.DOMAIN ? `https://${process.env.DOMAIN}` : 'https://qchat.example'), vapid.publicKey, vapid.privateKey);
 
 function iceServers(user) {
   const ice = [{ urls: (process.env.STUN_URLS || 'stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302').split(',') }];
@@ -73,7 +98,12 @@ const server = http.createServer(async (req, res) => {
       await sec.strike(ip, 15, 'scanner'); return deny(res, req, 404, 'not found');
     }
     if (url.pathname === '/health') { res.writeHead(200, { ...baseHeaders(req), 'content-type': 'application/json' }); return res.end(JSON.stringify({ ok: true, store: store.kind, bus: bus.kind })); }
-    if (url.pathname.startsWith('/admin')) return await admin(req, res, url, ip);
+    if (url.pathname.startsWith('/admin')) return await adminApi.handle(req, res, url, ip);
+    if (url.pathname === '/api/status') { // public service status (no internals)
+      if (!(await sec.allow('status:' + ip, 60, 60))) return deny(res, req, 429);
+      res.writeHead(200, { ...baseHeaders(req), 'content-type': 'application/json', 'cache-control': 'no-store' }); return res.end(JSON.stringify(await monitor.publicStatus()));
+    }
+    if (url.pathname === '/status') raw = '/status.html';
     if (req.method !== 'GET' && req.method !== 'HEAD') return deny(res, req, 405);
     let p = path.normalize(raw).replace(/^([/\\])+/, '') || 'index.html';
     if (/^@[a-z0-9_.]{3,24}$/i.test(p)) p = 'index.html'; // invite links: https://host/@username
@@ -90,32 +120,6 @@ const server = http.createServer(async (req, res) => {
 // Slowloris / slow-body protection
 server.headersTimeout = 15000; server.requestTimeout = 30000; server.keepAliveTimeout = 5000; server.maxHeadersCount = 60; server.maxRequestsPerSocket = 1000;
 
-// ---------- admin: intrusion-detection dashboard (enabled only when ADMIN_TOKEN is set) ----------
-async function admin(req, res, url, ip) {
-  if (!ADMIN_TOKEN || (process.env.ADMIN_IPS && !process.env.ADMIN_IPS.split(',').includes(ip))) return deny(res, req, 404, 'not found');
-  if (url.pathname === '/admin' || url.pathname === '/admin/') {
-    const file = await fs.promises.readFile(path.join(PUBLIC, 'admin.html'));
-    res.writeHead(200, { ...baseHeaders(req), 'content-type': MIME['.html'], 'content-security-policy': CSP, 'cache-control': 'no-store' }); return res.end(file);
-  }
-  if (url.pathname === '/admin/admin.js') { res.writeHead(200, { ...baseHeaders(req), 'content-type': MIME['.js'], 'cache-control': 'no-store' }); return res.end(await fs.promises.readFile(path.join(PUBLIC, 'admin.js'))); }
-  const token = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-  if (!timingSafeEqual(token, ADMIN_TOKEN)) {
-    await sec.event('admin_auth_failed', 'high', { ip, detail: { path: url.pathname } }); await sec.strike(ip, 10, 'admin_bruteforce');
-    return deny(res, req, 401, 'unauthorized');
-  }
-  const json = (o) => { res.writeHead(200, { ...baseHeaders(req), 'content-type': 'application/json', 'cache-control': 'no-store' }); res.end(JSON.stringify(o)); };
-  if (url.pathname === '/admin/api/events') return json(await store.listSecurityEvents({ since: Number(url.searchParams.get('since') || 0), limit: url.searchParams.get('limit') || 200, minSeverity: url.searchParams.get('minSeverity') || undefined, username: url.searchParams.get('user') || undefined }));
-  if (url.pathname === '/admin/api/summary') {
-    const ev = await store.listSecurityEvents({ since: Date.now() - 864e5, limit: 1000 });
-    const byType = {}, bySev = {}; for (const e of ev) { byType[e.type] = (byType[e.type] || 0) + 1; bySev[e.severity] = (bySev[e.severity] || 0) + 1; }
-    let connections = 0; for (const d of local.values()) connections += d.size;
-    return json({ last24h: { total: ev.length, byType, bySeverity: bySev }, bans: await sec.listBans(), connections, unauthenticated: [...wss.clients].filter((w) => !w.user).length, limits: LIMITS, store: store.kind, bus: bus.kind });
-  }
-  if (req.method === 'POST' && url.pathname === '/admin/api/unban') { const b = await readJson(req); await sec.unban(String(b.ip)); await sec.event('admin_unban', 'info', { detail: { ip: String(b.ip) } }); return json({ ok: true }); }
-  if (req.method === 'POST' && url.pathname === '/admin/api/ban') { const b = await readJson(req); await sec.ban(String(b.ip), Number(b.seconds) || 3600, 'admin'); return json({ ok: true }); }
-  return deny(res, req, 404, 'not found');
-}
-
 // ---------- connections ----------
 const local = new Map(); // user -> Map(device -> ws)
 const send = (ws, o) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); };
@@ -125,6 +129,7 @@ function onBusMessage(u, m) {
   const devs = local.get(u); if (!devs) return;
   if (m.kind === 'dev') send(devs.get(m.d), m.msg);
   else if (m.kind === 'all') for (const ws of devs.values()) if (ws.device !== m.except) send(ws, m.msg);
+  else if (m.kind === 'kickall') { for (const ws of devs.values()) { send(ws, { t: 'kicked', reason: m.reason }); ws.close(); } }
   else if (m.kind === 'kick') { const ws = devs.get(m.d); if (ws && ws.conn !== m.conn) { send(ws, { t: 'kicked', reason: m.reason }); ws.close(); } }
 }
 async function toDevice(u, d, msg) { const ws = localWs(u, d); if (ws) return send(ws, msg); await bus.publishUser(u, { kind: 'dev', d, msg }); }
@@ -155,7 +160,7 @@ function localWatchers(u, msg) { for (const devs of local.values()) for (const w
 const notifyWatchers = (u, msg) => bus.broadcast({ u, msg }); // reaches watchers on every instance
 
 await bus.start((ev) => (ev.msg ? localWatchers(ev.u, ev.msg) : onPresenceChange(ev.u)));
-const sec = createSecurity({ store, bus });
+const sec = createSecurity({ store: adminStore, bus });
 const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_PAYLOAD });
 const connsPerIp = new Map();
 function allowedOrigin(req) {
@@ -223,9 +228,10 @@ async function goOnline(ws, u, d) {
   if (bus.kind !== 'local') await bus.publishUser(u, { kind: 'kick', d, conn: ws.conn, reason: 'same_device' });
   await bus.setOnline(u, d, true);
   const user = await store.getUser(u); const dev = await store.getDevice(u, d);
-  send(ws, { t: 'ready', me: { username: u, aik: user.aik, deviceList: user.deviceList, displayName: user.profile.displayName, about: user.profile.about, avatar: user.profile.avatar, hideLastSeen: user.hideLastSeen },
+  trackLogin(u, d, dev, ws.ip);
+  send(ws, { t: 'ready', me: { username: u, aik: user.aik, deviceList: user.deviceList, displayName: user.profile.displayName, about: user.profile.about, avatar: user.profile.avatar, hideLastSeen: user.hideLastSeen, pinSet: !!(await store.getPin(u)) },
     ice: iceServers(u), vapid: vapid.publicKey, prekeys: { otpks: await store.countOtpks(u, d), spkId: dev.spk.id }, pushOn: !!dev.push });
-  const alerts = await store.listSecurityEvents({ username: u, since: Date.now() - 7 * 864e5, minSeverity: 'high', limit: 20 });
+  const alerts = await adminStore.listSecurityEvents({ username: u, since: Date.now() - 7 * 864e5, minSeverity: 'high', limit: 20 });
   if (alerts.length) send(ws, { t: 'security_alerts', alerts: alerts.filter((a) => ALERT_TYPES.has(a.type)).map(alertView) });
   await flushQueue(ws);
 }
@@ -246,11 +252,49 @@ async function handle(ws, m) {
     ws.pending = { u, d, nonce: crypto.randomBytes(32).toString('base64'), pow: deviceKnown ? 0 : await sec.powBits() };
     return send(ws, { t: 'challenge', nonce: ws.pending.nonce, exists: !!user, deviceKnown, aik: user?.aik, deviceList: user?.deviceList, pow: ws.pending.pow || undefined });
   }
+  // ---------- PIN login (pre-auth): returns the encrypted seeds only for the right PIN ----------
+  if (m.t === 'pin_params') {
+    const u = String(m.user || '').toLowerCase();
+    if (!USERNAME_RE.test(u) || !(await sec.allow('pinparams:' + ws.ip, 60, 600))) return send(ws, { t: 'pin_params', rid: m.rid, enabled: false, error: 'rate_limited' });
+    const rec = await store.getPin(u);
+    return send(ws, { t: 'pin_params', rid: m.rid, enabled: !!rec, salt: rec?.salt, attemptsLeft: rec ? LIMITS.pinMaxAttempts - rec.attempts : 0, lockedFor: rec ? Math.max(0, rec.lockedUntil - Date.now()) : 0 });
+  }
+  if (m.t === 'pin_unlock') {
+    const p = ws.pending; ws.pending = null; // one guess per fresh challenge
+    const fail = (o) => send(ws, { t: 'pin_result', ok: false, ...o });
+    if (!p) return fail({ error: 'No challenge' });
+    if (!sec.verifyPow(p.nonce, p.u, p.d, m.pow, p.pow)) { await sec.strike(ws.ip, 4, 'bad_pow'); return fail({ error: 'Proof-of-work check failed — please retry' }); }
+    if (!(await sec.allow('pintry:' + ws.ip, LIMITS.pinTriesPerIp, 3600))) {
+      if ((await sec.hit('pinbf:' + ws.ip, 3600)) === 1) await sec.event('pin_bruteforce', 'high', { ip: ws.ip, user: p.u });
+      await sec.strike(ws.ip, 10, 'pin_bruteforce'); return fail({ error: 'Too many PIN attempts from your network. Try again later.' });
+    }
+    const rec = await store.getPin(p.u);
+    if (!rec) return fail({ error: 'PIN login isn\'t set up for this account. Use your recovery key.' });
+    if (rec.lockedUntil > Date.now()) { await sec.event('pin_while_locked', 'medium', { ip: ws.ip, user: p.u }); return fail({ error: 'locked', lockedFor: rec.lockedUntil - Date.now(), attemptsLeft: LIMITS.pinMaxAttempts - rec.attempts }); }
+    if (timingSafeEqual(pinVerifier(String(m.auth || '')), rec.verifier)) {
+      await store.pinSucceeded(p.u);
+      await sec.event('pin_unlock', 'medium', { ip: ws.ip, user: p.u });
+      return send(ws, { t: 'pin_result', ok: true, share: decShare(rec.share, p.u), blob: rec.blob });
+    }
+    const n = await store.pinFailed(p.u, pinBackoff);
+    const left = LIMITS.pinMaxAttempts - n;
+    await sec.strike(ws.ip, 6, 'pin_failed');
+    if (left <= 0) {
+      await store.deletePin(p.u);
+      const e = await sec.event('pin_wiped', 'critical', { ip: ws.ip, user: p.u, detail: { attempts: n } });
+      await toUser(p.u, { t: 'security_alert', alert: alertView(e) });
+      return fail({ error: 'wiped' });
+    }
+    const e = await sec.event('pin_failed', 'high', { ip: ws.ip, user: p.u, detail: { attempt: n, left } });
+    await toUser(p.u, { t: 'security_alert', alert: alertView(e) });
+    return fail({ error: 'wrong', attemptsLeft: left, lockedFor: pinBackoff(n) });
+  }
   if (m.t === 'auth') { // existing device: sign the challenge with the device key
     const p = ws.pending; ws.pending = null; if (!p) return send(ws, { t: 'auth_error', error: 'No challenge' });
     const user = await store.getUser(p.u); const dev = user && await store.getDevice(p.u, p.d);
     if (!dev || !user.deviceList.devices.includes(p.d)) { await authFailed(ws, p.u, 'unknown_device', 'low'); return send(ws, { t: 'auth_error', error: 'device_unknown' }); }
     if (!dsaVerify(AUTH_DOMAIN, { user: p.u, device: p.d, nonce: p.nonce }, m.sig, dev.cert.sigPk)) { await authFailed(ws, p.u, 'bad_device_signature', 'high'); return send(ws, { t: 'auth_error', error: 'Bad signature' }); }
+    if (user.suspendedUntil > Date.now()) return send(ws, { t: 'auth_error', error: 'suspended', until: user.suspendedUntil, reason: user.suspendReason });
     return goOnline(ws, p.u, p.d);
   }
   if (m.t === 'enroll') { // new account or new device: prove possession of the account identity key (AIK)
@@ -262,6 +306,7 @@ async function handle(ws, m) {
     }
     if (!sec.verifyPow(p.nonce, p.u, p.d, m.pow, p.pow)) { await sec.strike(ws.ip, 4, 'bad_pow'); return send(ws, { t: 'auth_error', error: 'Proof-of-work check failed — please retry' }); }
     const user = await store.getUser(p.u);
+    if (user && user.suspendedUntil > Date.now()) return send(ws, { t: 'auth_error', error: 'This account has been suspended by the QChat team.' });
     if (user && m.register) return send(ws, { t: 'auth_error', error: 'That username is taken' });
     if (!user && !m.register) return send(ws, { t: 'auth_error', error: 'No account with that username' });
     if (!user) {
@@ -287,12 +332,14 @@ async function handle(ws, m) {
       const prof = m.profile || {};
       await store.createUser(p.u, aik, list, { displayName: cleanText(prof.displayName, 40) || p.u, about: 'Hey there! I am using QChat.', avatar: null });
       await sec.event('account_created', 'info', { ip: ws.ip, user: p.u });
+      activity(p.u, 'account_created', { device: cleanText(cert.name, 60) }, ws.ip); metric('new_users');
     } else {
       await store.updateUser(p.u, { deviceList: list });
       for (const d of await store.getDevices(p.u)) if (!list.devices.includes(d.device)) { await store.removeDevice(p.u, d.device); await toDevice(p.u, d.device, { t: 'kicked', reason: 'removed' }); }
     }
     await store.putDevice(p.u, p.d, cert, spk);
-    if (user) await sec.event('device_linked', 'high', { ip: ws.ip, user: p.u, detail: { device: p.d, name: cleanText(cert.name, 60) } });
+    if (user) activity(p.u, 'device_linked', { device: p.d, name: cleanText(cert.name, 60) }, ws.ip);
+    if (user) { const e = await sec.event('device_linked', 'high', { ip: ws.ip, user: p.u, detail: { device: p.d, name: cleanText(cert.name, 60) } }); await toUser(p.u, { t: 'security_alert', alert: alertView(e) }, p.d); }
     await store.addOtpks(p.u, p.d, goodOtpks);
     await goOnline(ws, p.u, p.d);
     await toUser(p.u, { t: 'devices_changed', username: p.u }, p.d);
@@ -338,7 +385,7 @@ async function handle(ws, m) {
       const user = await store.getUser(me); const list = m.deviceList;
       if (!verifyDeviceList(list, me, user.aik) || list.version <= user.deviceList.version) return send(ws, { t: 'error', error: 'bad_device_list' });
       await store.updateUser(me, { deviceList: list });
-      for (const d of user.deviceList.devices) if (!list.devices.includes(d)) { await store.removeDevice(me, d); await toDevice(me, d, { t: 'kicked', reason: 'removed' }); }
+      for (const d of user.deviceList.devices) if (!list.devices.includes(d)) { await store.removeDevice(me, d); await toDevice(me, d, { t: 'kicked', reason: 'removed' }); activity(me, 'device_removed', { device: d }, ws.ip); }
       await toUser(me, { t: 'devices_changed', username: me });
       return notifyWatchers(me, { t: 'devices_changed', username: me });
     }
@@ -352,6 +399,7 @@ async function handle(ws, m) {
       if (m.about !== undefined) prof.about = cleanText(m.about, 140);
       if (m.avatar !== undefined) prof.avatar = cleanAvatar(m.avatar);
       await store.updateUser(me, { profile: prof, hideLastSeen: m.hideLastSeen });
+      activity(me, 'profile_updated', { fields: ['displayName', 'about', 'avatar', 'hideLastSeen'].filter((k) => m[k] !== undefined) }, ws.ip);
       const pu = await publicUser(me);
       send(ws, { t: 'profile_ok', me: { ...pu, hideLastSeen: m.hideLastSeen ?? user.hideLastSeen } });
       await toUser(me, { t: 'profile_update', user: pu }, myDev);
@@ -387,6 +435,7 @@ async function handle(ws, m) {
         await toDevice(r.u, r.d, { t: 'env', ...item });
         if (m.push && dev.push && r.u !== me && !(await bus.onlineDevices(r.u)).includes(r.d)) sendPush(r.u, r.d, dev.push, { from: me, kind: ['call', 'live'].includes(m.push) ? m.push : 'msg' });
       }
+      metric('messages'); metric('deliveries', targets.length); metric('bytes', JSON.stringify(m.env).length); userSent(me);
       return send(ws, { t: 'sent', id, ts: item.ts, ok: true });
     }
     case 'ack': {
@@ -401,10 +450,28 @@ async function handle(ws, m) {
       for (const u of (Array.isArray(m.to) ? m.to : []).slice(0, 256)) if (u !== me && USERNAME_RE.test(u)) await toUser(u, msg);
       return;
     }
+    case 'pin_set': {
+      const ok = (x, n) => typeof x === 'string' && x.length < 100 && unb64(x).length === n;
+      const b = m.blob;
+      if (!ok(m.salt, 16) || !ok(m.auth, 32) || !ok(m.share, 32) || !b || typeof b.iv !== 'string' || typeof b.ct !== 'string' || b.ct.length > 400 || unb64(b.iv).length !== 12) return send(ws, { t: 'error', error: 'bad_pin_setup' });
+      const existed = !!(await store.getPin(me));
+      activity(me, existed ? 'pin_changed' : 'pin_set', { device: myDev }, ws.ip);
+      await store.setPin(me, { salt: m.salt, verifier: pinVerifier(m.auth), share: encShare(m.share, me), blob: { iv: b.iv, ct: b.ct } });
+      const e = await sec.event(existed ? 'pin_changed' : 'pin_set', existed ? 'high' : 'info', { ip: ws.ip, user: me, detail: { device: myDev } });
+      if (existed) await toUser(me, { t: 'security_alert', alert: alertView(e) }, myDev);
+      return send(ws, { t: 'pin_ok', enabled: true });
+    }
+    case 'pin_clear': {
+      await store.deletePin(me);
+      const e = await sec.event('pin_removed', 'high', { ip: ws.ip, user: me, detail: { device: myDev } });
+      await toUser(me, { t: 'security_alert', alert: alertView(e) }, myDev);
+      return send(ws, { t: 'pin_ok', enabled: false });
+    }
     case 'report': {
       const target = String(m.username || '').toLowerCase();
       if (!USERNAME_RE.test(target) || target === me || !(await store.getUser(target))) return;
       await store.addReport(me, target, cleanText(m.reason, 60));
+      activity(me, 'reported_user', { target, reason: cleanText(m.reason, 60) }, ws.ip);
       await sec.event('user_reported', 'medium', { ip: ws.ip, user: target, detail: { by: me, reason: cleanText(m.reason, 60) } });
       if (await store.countReports(target, Date.now() - 864e5) === 5) await sec.event('account_restricted', 'high', { user: target, detail: { reason: '5+ reports in 24h' } });
       return send(ws, { t: 'report_ok', username: target });
@@ -412,18 +479,61 @@ async function handle(ws, m) {
     case 'push_sub': {
       const s = m.sub; const ok = s && typeof s.endpoint === 'string' && /^https:\/\//.test(s.endpoint) && s.keys?.p256dh && s.keys?.auth;
       await store.setPush(me, myDev, ok ? { endpoint: s.endpoint, keys: { p256dh: String(s.keys.p256dh), auth: String(s.keys.auth) } } : null);
+      activity(me, ok ? 'push_enabled' : 'push_disabled', { device: myDev }, ws.ip);
       return send(ws, { t: 'push_ok', on: !!ok });
     }
     case 'delete_account': {
       await toUser(me, { t: 'kicked', reason: 'deleted' }, myDev);
-      await store.deleteUser(me); send(ws, { t: 'deleted' }); ws.close();
+      await store.deleteUser(me); await adminStore.forgetUser(me); await sec.event('account_deleted', 'info', { ip: ws.ip, user: me }); send(ws, { t: 'deleted' }); ws.close();
       return;
     }
   }
 }
 
+// ---------- activity log & analytics (metadata only; buffered, flushed every 15 s) ----------
+function activity(username, type, detail, ip) { adminStore.addActivity({ username, type, detail, ipHash: ip ? sec.ipHash(ip) : null }).catch((e) => console.error('activity', e.message)); }
+const metricBuf = new Map(), userBuf = new Map(), activeBuf = new Set(), loginSeen = new Map();
+function metric(name, n = 1) { const k = day() + '|' + name; metricBuf.set(k, (metricBuf.get(k) || 0) + n); }
+function userSent(u) { const k = day() + '|' + u; userBuf.set(k, (userBuf.get(k) || 0) + 1); }
+function trackLogin(u, d, dev, ip) {
+  activeBuf.add(day() + '|' + u);
+  const k = u + ':' + d; if (Date.now() - (loginSeen.get(k) || 0) < 3600e3) return;
+  loginSeen.set(k, Date.now()); metric('logins'); activity(u, 'login', { device: d, name: cleanText(dev?.cert?.name, 60) }, ip);
+}
+async function flushMetrics() {
+  const m = [...metricBuf].map(([k, n]) => [...k.split('|'), n]); metricBuf.clear();
+  const u = [...userBuf].map(([k, n]) => [...k.split('|'), n]); userBuf.clear();
+  const a = [...activeBuf]; activeBuf.clear();
+  try {
+    if (m.length) await adminStore.incrStats(m);
+    if (u.length) await adminStore.incrUserDaily(u);
+    const byDay = {}; for (const k of a) { const [d, user] = k.split('|'); (byDay[d] ||= []).push(user); }
+    for (const [d, users] of Object.entries(byDay)) await adminStore.markActive(d, users);
+  } catch (e) { console.error('metrics flush', e.message); }
+}
+setInterval(flushMetrics, Number(process.env.METRICS_FLUSH_MS || 15000)).unref();
+async function kickUser(u, reason) {
+  for (const ws of local.get(u)?.values() || []) { send(ws, { t: 'kicked', reason }); ws.close(); }
+  if (bus.kind !== 'local') await bus.publishUser(u, { kind: 'kickall', reason });
+}
+async function kickDevice(u, d, reason) {
+  const ws = localWs(u, d); if (ws) { send(ws, { t: 'kicked', reason }); ws.close(); }
+  if (bus.kind !== 'local') await bus.publishUser(u, { kind: 'kick', d, conn: null, reason });
+}
+function localStats() { let connections = 0; for (const d of local.values()) connections += d.size; return { connections, users: local.size }; }
+const monitor = createMonitor({ store, adminStore, bus, sec, port: PORT, instanceId: INSTANCE_ID, localStats, vapidReady: () => !!vapid?.publicKey });
+const adminApi = await createAdmin({ store, adminStore, sec, LIMITS, monitor, PUBLIC, CSP, baseHeaders, deny, readJson, isHttps, clientIp, kickUser, kickDevice, onlineDevices: (u) => bus.onlineDevices(u), publicUser });
+// First-run bootstrap: create the owner admin from env (kept in .env, never in the repo). 2FA is enrolled at first sign-in.
+if (process.env.ADMIN_BOOTSTRAP_USER && process.env.ADMIN_BOOTSTRAP_PASSWORD && (await adminStore.countAdmins()) === 0) {
+  try { const r = await adminApi.addAdmin(process.env.ADMIN_BOOTSTRAP_USER, process.env.ADMIN_BOOTSTRAP_PASSWORD, 'owner', { enrolled: false }); console.log(`Created owner admin ${r.username} — sign in at /admin to set up two-factor authentication.`); await adminStore.audit('bootstrap', 'create_admin', r.username, { role: 'owner' }); }
+  catch (e) { console.error('Admin bootstrap failed:', e.message); }
+}
+
 // ---------- detection helpers ----------
-const ALERT_TYPES = new Set(['account_takeover_attempt', 'account_locked', 'device_linked', 'bad_device_signature']);
+const ALERT_TYPES = new Set(['account_takeover_attempt', 'account_locked', 'device_linked', 'bad_device_signature', 'pin_failed', 'pin_wiped', 'pin_changed', 'pin_removed']);
+// growing lockouts after wrong PINs: 3rd → 1 min, 4th → 5 min, 5th → 15 min, 6th → 1 h, then 4 h, 12 h, 24 h
+const PIN_BACKOFF_S = [0, 0, 0, 60, 300, 900, 3600, 14400, 43200, 86400];
+const pinBackoff = (n) => (LIMITS.pinBackoff ? (PIN_BACKOFF_S[Math.min(n, PIN_BACKOFF_S.length - 1)] || 0) * 1000 : 0);
 const alertView = (e) => ({ id: e.id, ts: e.ts, type: e.type, ipHash: e.ipHash, detail: e.detail });
 async function authFailed(ws, user, reason, severity) {
   const e = await sec.event(reason === 'bad_device_signature' ? 'bad_device_signature' : 'auth_failed', severity, { ip: ws.ip, user, detail: { reason } });
@@ -472,8 +582,8 @@ setInterval(async () => {
   }
   await bus.refresh(list).catch(() => {});
 }, 30000);
-setInterval(() => { store.purgeQueue(Date.now() - QUEUE_TTL).catch(() => {}); store.purgeSecurityEvents(Date.now() - 90 * 864e5).catch(() => {}); }, 3600e3);
+setInterval(() => { store.purgeQueue(Date.now() - QUEUE_TTL).catch(() => {}); adminStore.purge().catch(() => {}); }, 3600e3);
 process.on('unhandledRejection', (e) => console.error('unhandled', e));
 
-server.listen(PORT, () => console.log(`QChat running on http://localhost:${PORT} (store: ${store.kind}, bus: ${bus.kind})`));
-for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, async () => { server.close(); await bus.close().catch(() => {}); await store.close().catch(() => {}); process.exit(0); });
+server.listen(PORT, () => { console.log(`QChat running on http://localhost:${PORT} (store: ${store.kind}, admin store: ${adminStore.kind}, bus: ${bus.kind})`); monitor.start(); });
+for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, async () => { monitor.stop(); server.close(); await flushMetrics(); await bus.close().catch(() => {}); await store.close().catch(() => {}); await adminStore.close().catch(() => {}); process.exit(0); });

@@ -4,5 +4,6 @@ await Promise.all([
   build({ ...common, entryPoints: ['src/client/app.js'], format: 'esm', outfile: 'public/app.js' }),
   build({ ...common, entryPoints: ['src/client/e2ee-worker.js'], format: 'iife', outfile: 'public/e2ee-worker.js' }),
   build({ ...common, entryPoints: ['src/client/sw.js'], format: 'iife', outfile: 'public/sw.js' }),
+  build({ ...common, entryPoints: ['src/admin/admin.js'], format: 'iife', outfile: 'public/admin.js' }),
 ]);
-console.log('Built public/app.js, public/e2ee-worker.js, public/sw.js');
+console.log('Built public/app.js, public/e2ee-worker.js, public/sw.js, public/admin.js');

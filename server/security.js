@@ -17,6 +17,9 @@ export const LIMITS = {
   newContactsPerDayNew: cfg('NEW_CONTACTS_PER_DAY_NEW_ACCOUNT', 60),
   newContactsPerDayReported: cfg('NEW_CONTACTS_PER_DAY_REPORTED', 10),
   sendPerMin: cfg('SEND_PER_MIN', 900),
+  pinMaxAttempts: cfg('PIN_MAX_ATTEMPTS', 10),       // wrong PINs before PIN login is permanently wiped
+  pinTriesPerIp: cfg('PIN_TRIES_PER_IP', 30),       // PIN attempts per IP per hour (across all accounts)
+  pinBackoff: cfg('PIN_BACKOFF', 1),                // 0 disables lockout delays (tests only)
   strikeBan: cfg('STRIKE_BAN', 40),                 // strike points in 10 min that trigger a ban
   banSeconds: cfg('BAN_SECONDS', 900),
 };

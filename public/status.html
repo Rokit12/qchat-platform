@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>QChat status</title>
+  <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body class="admin">
+  <main class="status-page">
+    <header class="adm-head"><img src="/icon.svg" alt="" /><h1>QChat status</h1><span class="grow"></span><a class="btn" href="/">Open QChat</a></header>
+    <div id="overall" class="status-strip st-unknown"><b>● Checking…</b></div>
+    <div class="adm-panel" id="services"></div>
+    <div class="adm-panel"><h3>Recent incidents</h3><div id="incidents" class="muted">—</div></div>
+    <p class="muted small">Updated automatically every 60 seconds. Bars show the last 30 days (green = fully up, orange = partial outage, red = down).</p>
+  </main>
+  <script src="/status.js"></script>
+</body>
+</html>

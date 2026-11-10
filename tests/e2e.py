@@ -21,8 +21,17 @@ async def register(p, u, dn):
     await p.click("#createForm button")
     await p.wait_for_selector("#obKey:not(.hidden)", timeout=20000)
     key = await p.text_content("#obKeyText")
-    await p.click("#obContinue"); await p.wait_for_selector("#app:not(.hidden)")
+    await p.click("#obContinue")
+    await set_pin(p, PIN)
     return key
+
+PIN = "482916"
+async def set_pin(p, pin):
+    await p.wait_for_selector("#obPin:not(.hidden)"); await p.fill("#pin1", pin); await p.fill("#pin2", pin)
+    await p.click("#pinSave")
+    try: await p.wait_for_selector("#app:not(.hidden)", timeout=30000)
+    except Exception:
+        print("PIN step stuck:", await p.text_content("#pinErr"), "| obError:", await p.text_content("#obError")); await p.screenshot(path=f"{OUT}/pin_stuck.png"); raise
 
 async def open_dm(p, u):
     await p.click("#newChatBtn"); await p.fill("#ncUser", u); await p.click("#ncGo")
@@ -65,12 +74,14 @@ async def main():
 
         # ---- second device for alice + history transfer ----
         ca2, a2 = await mk(b, "alice2", URL2)
-        await a2.click("[data-tab=restore]"); await a2.fill("#restoreForm [name=username]", "alice"); await a2.fill("#restoreForm [name=key]", ka)
-        await a2.click("#restoreForm button"); await a2.wait_for_selector("#app:not(.hidden)", timeout=20000)
-        await a.wait_for_selector("#toast:has-text('New device linked')", timeout=15000)
+        await a2.click("[data-tab=restore]"); await a2.click("#toggleKeyLogin"); await a2.fill("#restoreForm [name=username]", "alice"); await a2.fill("#restoreForm [name=key]", ka)
+        await a2.click("#restoreForm button[type=submit]"); await a2.wait_for_selector("#obPin:not(.hidden) >> text=set a new login PIN", timeout=30000)
+        await set_pin(a2, "715384"); ok("recovered with the recovery key (forgot-PIN path) and set a new PIN")
         await a.wait_for_selector("#modal:not(.hidden) >> text=Copy history", timeout=15000); await a.click("#cfYes")
         await a2.wait_for_selector(".chat-item:has-text('Bob')", timeout=20000)
         await chat(a2, "Bob"); await a2.wait_for_selector("text=Hello Alice (edited)", timeout=10000)
+        await a.click("#settingsBtn"); acts = " ".join(await a.locator(".sec-list li").all_text_contents()); await a.keyboard.press("Escape")
+        assert "new device was linked" in acts and "PIN was changed" in acts, acts; ok("alice's first device was alerted: new device linked + PIN changed")
         await a2.wait_for_selector(".msg img.media[src^='blob:']", timeout=10000); ok("second device linked (old device alerted); history + media copied over the PQ channel")
         await send(bb, "to both of your devices"); await a.wait_for_selector("text=to both of your devices", timeout=15000)
         await a2.wait_for_selector("text=to both of your devices", timeout=15000); ok("multi-device fan-out")
@@ -124,6 +135,18 @@ async def main():
         await c.click("#hangBtn")
         await a.wait_for_function("document.querySelectorAll('#callGrid .tile').length === 1", timeout=15000); ok("participant left, key rotated, call continues")
         await a.click("#hangBtn"); await bb.wait_for_selector("#callView.hidden", state="attached", timeout=15000)
+
+        # ---- log in on a brand-new device with only username + 6-digit PIN ----
+        cx, x = await mk(b, "carol-new-phone")
+        await x.click("[data-tab=restore]"); await x.fill("#restoreForm [name=username]", "carol"); await x.fill("#restoreForm [name=pin]", "000000")
+        await x.click("#restoreForm button[type=submit]"); await x.wait_for_selector("#obError:has-text('Wrong PIN')", timeout=40000)
+        msg = await x.text_content("#obError"); assert "9 attempts left" in msg, msg
+        await c.wait_for_selector("#toast:has-text('WRONG login PIN')", timeout=15000); ok(f"wrong PIN rejected ({msg.strip()}) and carol's existing device was alerted")
+        await x.fill("#restoreForm [name=pin]", PIN); await x.click("#restoreForm button[type=submit]")
+        await x.wait_for_selector("#app:not(.hidden)", timeout=60000)
+        await c.wait_for_selector("#modal:not(.hidden) >> text=Copy history", timeout=20000); await c.click("#cfYes")
+        await x.wait_for_selector(".chat-item:has-text('World Friends')", timeout=30000); ok("logged in on a new device with just username + PIN (no recovery key), group chat available")
+        await cx.close()
 
         # ---- live stream from Status with pop comments + hearts ----
         await a.click("#statusBtn"); await a.click("#stGoLive"); await a.fill("#glTitle", "Sunset from my balcony"); await a.click("#glGo")

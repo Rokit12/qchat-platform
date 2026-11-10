@@ -75,7 +75,7 @@ test('server: SQLite, single instance', async (t) => {
 });
 
 test('server: Postgres + Redis, two instances', { skip: !process.env.QCHAT_TEST_PG && 'set QCHAT_TEST_PG and QCHAT_TEST_REDIS' }, async (t) => {
-  const env = { DATABASE_URL: process.env.QCHAT_TEST_PG, REDIS_URL: process.env.QCHAT_TEST_REDIS };
+  const env = { DATABASE_URL: process.env.QCHAT_TEST_PG, REDIS_URL: process.env.QCHAT_TEST_REDIS, ...(process.env.QCHAT_TEST_ADMIN_PG ? { ADMIN_DATABASE_URL: process.env.QCHAT_TEST_ADMIN_PG } : { DATA_DIR: fs.mkdtempSync(path.join(os.tmpdir(), 'qchat-pg-')) }) };
   const a = await startServer(3202, env), b = await startServer(3203, env);
   try { await scenario(t, 3202, 3203); } finally { a.kill(); b.kill(); }
 });
