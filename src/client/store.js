@@ -7,8 +7,17 @@ const DB = 'qchat2';
 let db, dek = null, dekRaw = null, closing = false;
 
 function req(r) { return new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); }
+// Fallback when the browser refuses IndexedDB (e.g. a sandboxed embed or strict private mode): the same
+// encrypted records are kept in memory instead, for this tab only.
+let mem = null;
+export const isMemoryOnly = () => !!mem;
+function memStore(name) {
+  const m = mem[name];
+  return { get: (k) => ({ result: m.get(k) }), put: (v, k) => { m.set(k, v); return {}; }, delete: (k) => { m.delete(k); return {}; }, getAllKeys: () => ({ result: [...m.keys()] }), clear: () => { m.clear(); return {}; } };
+}
 function txn(store, mode, fn) {
   if (closing) return Promise.resolve(undefined); // device is being wiped: drop late writes
+  if (mem) { const r = fn(memStore(store)); return Promise.resolve(r && 'result' in r ? r.result : undefined); }
   return new Promise((res, rej) => {
     const t = db.transaction(store, mode); const r = fn(t.objectStore(store));
     t.oncomplete = () => res(r && 'result' in r ? r.result : undefined); t.onerror = () => rej(t.error); t.onabort = () => rej(t.error);
@@ -16,9 +25,15 @@ function txn(store, mode, fn) {
 }
 export async function openDb() {
   closing = false;
-  const r = indexedDB.open(DB, 1);
-  r.onupgradeneeded = () => { r.result.createObjectStore('kv'); r.result.createObjectStore('meta'); };
-  db = await req(r);
+  if (mem) return;
+  try {
+    const r = indexedDB.open(DB, 1);
+    r.onupgradeneeded = () => { r.result.createObjectStore('kv'); r.result.createObjectStore('meta'); };
+    db = await req(r);
+  } catch (e) {
+    console.warn('IndexedDB unavailable — keeping encrypted data in memory for this tab only', e?.message);
+    mem = { kv: new Map(), meta: new Map() };
+  }
 }
 const metaGet = (k) => txn('meta', 'readonly', (s) => s.get(k));
 const metaSet = (k, v) => txn('meta', 'readwrite', (s) => s.put(v, k));
@@ -65,4 +80,4 @@ export async function del(key) { await txn('kv', 'readwrite', (s) => s.delete(ke
 export async function keys(prefix) { const all = await txn('kv', 'readonly', (s) => s.getAllKeys()); return all.filter((k) => k.startsWith(prefix)); }
 export async function putBytes(key, bytes, mime) { const r = await enc(key, bytes); r.mime = mime; await txn('kv', 'readwrite', (s) => s.put(r, key)); }
 export async function getBytes(key) { const r = await txn('kv', 'readonly', (s) => s.get(key)); return r ? { bytes: await dec(key, r), mime: r.mime } : null; }
-export async function wipe() { closing = true; db?.close(); await req(indexedDB.deleteDatabase(DB)).catch(() => {}); }
+export async function wipe() { if (mem) { mem.kv.clear(); mem.meta.clear(); return; } closing = true; db?.close(); await req(indexedDB.deleteDatabase(DB)).catch(() => {}); }
