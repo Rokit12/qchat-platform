@@ -19,6 +19,8 @@ export const LIMITS = {
   sendPerMin: cfg('SEND_PER_MIN', 900),
   deliveriesPerHour: cfg('DELIVERIES_PER_HOUR', 250000),     // device deliveries per account per hour (anti-spam for big groups)
   bulkLookupPerHour: cfg('BULK_LOOKUP_PER_HOUR', 10000),
+  backupMaxBytes: cfg('BACKUP_MAX_BYTES', 20 * 1024 * 1024), // encrypted chat backup per account
+  backupPerHour: cfg('BACKUP_PER_HOUR', 30),
   maxGroupMembers: cfg('MAX_GROUP_MEMBERS', 3500),
   maxFanoutDevices: cfg('MAX_FANOUT_DEVICES', 20000),
   pinMaxAttempts: cfg('PIN_MAX_ATTEMPTS', 10),       // wrong PINs before PIN login is permanently wiped

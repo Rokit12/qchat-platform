@@ -1,7 +1,7 @@
 // Encrypted local storage. Every value in IndexedDB is AES-256-GCM encrypted with a data key (DEK).
 // The DEK is wrapped either by a non-extractable device key (no passcode) or by an Argon2id-derived
 // key from the user's passcode. With a passcode set, nothing readable is left on disk when locked.
-import { rand, te, td, passcodeKey, aesEncrypt, aesDecrypt, subtle } from '../shared/crypto.js';
+import { rand, te, td, passcodeKey, aesEncrypt, aesDecrypt, subtle, kdf } from '../shared/crypto.js';
 
 const DB = 'qchat2';
 let db, dek = null, dekRaw = null, closing = false;
@@ -41,10 +41,11 @@ export const getPlain = metaGet, setPlain = metaSet; // non-secret local prefs (
 
 async function useDek(raw) { dekRaw = raw; dek = await subtle.importKey('raw', raw, 'AES-GCM', false, ['encrypt', 'decrypt']); }
 
-/** Returns 'new' | 'unlocked' | 'locked' */
+/** Returns 'new' | 'unlocked' | 'locked' | 'signedout' */
 export async function keyState() {
   const k = await metaGet('keys');
   if (!k) return 'new';
+  if (k.acct) return 'signedout';
   if (k.device) { const raw = await aesDecryptWith(k.device, k.iv, k.wrapped); await useDek(raw); return 'unlocked'; }
   return 'locked';
 }
@@ -69,6 +70,24 @@ export async function unlock(code) {
   const k = await metaGet('keys');
   const kek = await passcodeKey(code, k.salt);
   try { await useDek(await aesDecrypt(kek, k.iv, k.wrapped, te.encode('qchat-dek'))); return true; } catch { return false; }
+}
+
+// ----- signed out: data stays on the device, locked with a key only the account can re-derive -----
+// The data key is re-wrapped with a key derived from the account seeds, which come back only through
+// username + PIN (server-assisted, rate-limited) or the recovery key. Nothing readable is left on disk.
+const acctKek = (backupKey, user) => kdf(backupKey, 'qchat-salt', 'qchat-local-signout-v1|' + user, 32);
+export async function signedOutUser() { return (await metaGet('keys'))?.acct || null; }
+export async function signOut(backupKey, user) {
+  if (!dekRaw) throw new Error('locked');
+  const { iv, ct } = await aesEncrypt(acctKek(backupKey, user), dekRaw, te.encode('qchat-dek-acct|' + user));
+  await metaSet('keys', { acct: user, iv, wrapped: ct });
+  dek = null; dekRaw = null;
+}
+/** Unlock a signed-out device with the account's backup key. Returns false if it's the wrong account. */
+export async function signIn(backupKey, user) {
+  const k = await metaGet('keys'); if (!k?.acct || k.acct !== user) return false;
+  try { await useDek(await aesDecrypt(acctKek(backupKey, user), k.iv, k.wrapped, te.encode('qchat-dek-acct|' + user))); } catch { return false; }
+  await wrapWithDeviceKey(dekRaw); return true;
 }
 
 // ----- encrypted key/value -----

@@ -531,6 +531,20 @@ async function handle(ws, m) {
       activity(me, ok ? 'push_enabled' : 'push_disabled', { device: myDev }, ws.ip);
       return send(ws, { t: 'push_ok', on: !!ok });
     }
+    case 'backup_put': { // end-to-end encrypted chat backup: {iv, ct} — the server can't read it
+      const ok = typeof m.iv === 'string' && m.iv.length <= 24 && B64_RE.test(m.iv) && typeof m.ct === 'string' && B64_RE.test(m.ct) && m.ct.length <= LIMITS.backupMaxBytes;
+      if (!ok) return send(ws, { t: 'backup_ok', rid: m.rid, ok: false, error: m.ct?.length > LIMITS.backupMaxBytes ? 'too_large' : 'bad_backup' });
+      if (!(await sec.allow('backup:' + me, LIMITS.backupPerHour, 3600))) return send(ws, { t: 'backup_ok', rid: m.rid, ok: false, error: 'rate_limited' });
+      await store.putBackup(me, JSON.stringify({ v: 1, iv: m.iv, ct: m.ct }));
+      return send(ws, { t: 'backup_ok', rid: m.rid, ok: true, at: Date.now() });
+    }
+    case 'backup_delete': await store.deleteBackup(me); return send(ws, { t: 'backup_ok', rid: m.rid, ok: true, deleted: true });
+    case 'backup_get': {
+      const b = await store.getBackup(me);
+      if (!b) return send(ws, { t: 'backup', rid: m.rid, none: true });
+      const d = JSON.parse(b.data);
+      return send(ws, { t: 'backup', rid: m.rid, iv: d.iv, ct: d.ct, at: b.updated });
+    }
     case 'delete_account': {
       await toUser(me, { t: 'kicked', reason: 'deleted' }, myDev);
       await store.deleteUser(me); await adminStore.forgetUser(me); await sec.event('account_deleted', 'info', { ip: ws.ip, user: me }); send(ws, { t: 'deleted' }); ws.close();

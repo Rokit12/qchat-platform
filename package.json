@@ -7,7 +7,7 @@
     "build": "node build.mjs",
     "prestart": "node build.mjs",
     "start": "node --disable-warning=ExperimentalWarning server/index.js",
-    "test": "node --test --test-timeout=120000 tests/crypto.test.mjs tests/linksafety.test.mjs tests/server.test.mjs tests/security.test.mjs tests/admin.test.mjs tests/senderkey.test.mjs tests/biggroup.test.mjs",
+    "test": "node --test --test-timeout=120000 tests/crypto.test.mjs tests/linksafety.test.mjs tests/server.test.mjs tests/security.test.mjs tests/admin.test.mjs tests/senderkey.test.mjs tests/biggroup.test.mjs tests/backup.test.mjs",
     "audit": "npm audit --omit=dev",
     "admin": "node --disable-warning=ExperimentalWarning server/admin-cli.js"
   },

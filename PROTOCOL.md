@@ -132,6 +132,8 @@ Groups are managed by clients. Group **messages** use **sender keys** (the appro
 - **No passcode:** the DEK is wrapped by a non‑extractable WebCrypto key held by the browser.
 - **With a passcode:** the DEK is wrapped by an Argon2id‑derived key, and nothing usable is stored until unlock. Auto‑lock reloads the page, which drops all secrets from memory.
 - **Encrypted backup:** `QCB1 ‖ IV ‖ AES‑256‑GCM(HKDF(aikSeed ‖ backupSeed, "qchat-backup-v1"), JSON, AAD = "qchat-backup-v1|user")`.
+- **Automatic server backup:** the same snapshot (chats, messages, media up to 2 MB each, at most ~18 MB) encrypted with the same backup key, `AAD = "qchat-cloud-v1|user"`, uploaded about 20 s after changes (at most once a minute; `backup_put`). The server stores one opaque copy per account and deletes it with the account. A new device fetches it (`backup_get`) right after login.
+- **Log out ≠ delete:** logging out re‑wraps the local data key with `HKDF(backupKey, "qchat-local-signout-v1|user")` and removes the device key, so nothing on disk is readable until the account seeds come back (username + PIN via the server, or the recovery key). The device stays linked, so messages that arrive meanwhile wait in its queue. Only **Delete account** erases the account, its server backup and local data.
 
 ## 10. Push notifications
 

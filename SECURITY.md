@@ -132,6 +132,12 @@ A 6‑digit PIN has only a million possibilities, so it's protected the way Sign
 
 **Remaining trust:** whoever runs the server *and* holds `PIN_PEPPER` could try PINs offline. Signal removes that last bit of trust with secure‑enclave hardware; QChat's design is ready for a hardware security module to hold the pepper.
 
+## 4c. Log out and encrypted backups
+
+- **Log out keeps your data.** On the device it stays encrypted, locked with a key derived from your account seeds; it opens again only after username + PIN (with all the PIN protections above) or the recovery key.
+- **Server backup is end‑to‑end encrypted** with a key derived from your recovery‑key seeds. The server and its admins see only its size and time. Limits: `BACKUP_MAX_BYTES` (20 MB), `BACKUP_PER_HOUR` (30). It's deleted with the account, and you can turn it off (which deletes it) in Settings.
+- **Trade‑off to know:** if PIN login is on, anyone who can both run the server *and* defeat the PIN protections (pepper, attempt limits, wipe after 10 tries) could reach the backup. With PIN login turned off, only the recovery key can open it.
+
 ## 5. Spam and abuse
 
 **Proof‑of‑work at sign‑up and device linking.** Each attempt requires solving a small computing puzzle: about 0.6 seconds in a browser at the default difficulty. The puzzles automatically get harder when many sign‑ups happen at once.

@@ -15,6 +15,7 @@ CREATE INDEX IF NOT EXISTS queue_ts ON queue (ts);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value ${text} NOT NULL);
 CREATE TABLE IF NOT EXISTS pin_recovery (username TEXT PRIMARY KEY, salt TEXT NOT NULL, verifier TEXT NOT NULL, share ${text} NOT NULL, blob ${text} NOT NULL,
   attempts INTEGER NOT NULL DEFAULT 0, locked_until ${big} NOT NULL DEFAULT 0, updated ${big} NOT NULL);
+CREATE TABLE IF NOT EXISTS backups (username TEXT PRIMARY KEY, data ${text} NOT NULL, size INTEGER NOT NULL, updated ${big} NOT NULL);
 CREATE TABLE IF NOT EXISTS reports (reporter TEXT NOT NULL, target TEXT NOT NULL, reason TEXT, ts ${big} NOT NULL, PRIMARY KEY (reporter, target));`;
 
 const rowUser = (r) => r && ({ username: r.username, aik: r.aik, deviceList: JSON.parse(r.device_list), profile: JSON.parse(r.profile), hideLastSeen: !!r.hide_last_seen, lastSeen: r.last_seen == null ? null : Number(r.last_seen), createdAt: Number(r.created_at), suspendedUntil: Number(r.suspended_until || 0), suspendReason: r.suspend_reason || '' });
@@ -43,7 +44,7 @@ function api(db) {
       vals.push(u); await db.run(`UPDATE users SET ${sets.join(',')} WHERE username=$${vals.length}`, vals);
     },
     async deleteUser(u) {
-      await db.tx(async (t) => { for (const tb of ['otpks', 'devices', 'queue', 'users', 'pin_recovery']) await t.run(`DELETE FROM ${tb} WHERE username=$1`, [u]); await t.run('DELETE FROM reports WHERE reporter=$1 OR target=$1', [u]); });
+      await db.tx(async (t) => { for (const tb of ['otpks', 'devices', 'queue', 'users', 'pin_recovery', 'backups']) await t.run(`DELETE FROM ${tb} WHERE username=$1`, [u]); await t.run('DELETE FROM reports WHERE reporter=$1 OR target=$1', [u]); });
     },
     async getDevices(u) { return (await db.q('SELECT * FROM devices WHERE username=$1 ORDER BY created_at', [u])).map(rowDev); },
     async getDevicesMany(users) { // bulk lookup for large-group fan-out (chunked IN so it stays fast at 3,500+ members)
@@ -95,6 +96,10 @@ function api(db) {
     },
     async queueStats() { return (await db.q('SELECT COUNT(*) AS n FROM queue'))[0]; },
     async purgeQueue(olderThan) { await db.run('DELETE FROM queue WHERE ts < $1', [olderThan]); },
+    // end-to-end encrypted chat backup (opaque to the server): one per account, replaced on every upload
+    async putBackup(u, data) { await db.run('INSERT INTO backups (username, data, size, updated) VALUES ($1,$2,$3,$4) ON CONFLICT (username) DO UPDATE SET data=excluded.data, size=excluded.size, updated=excluded.updated', [u, data, data.length, Date.now()]); },
+    async getBackup(u) { const r = (await db.q('SELECT data, updated FROM backups WHERE username=$1', [u]))[0]; return r ? { data: r.data, updated: Number(r.updated) } : null; },
+    async deleteBackup(u) { await db.run('DELETE FROM backups WHERE username=$1', [u]); },
     async getPin(u) { const r = (await db.q('SELECT * FROM pin_recovery WHERE username=$1', [u]))[0]; return r ? { salt: r.salt, verifier: r.verifier, share: r.share, blob: JSON.parse(r.blob), attempts: Number(r.attempts), lockedUntil: Number(r.locked_until) } : null; },
     async setPin(u, p) {
       await db.run('INSERT INTO pin_recovery (username, salt, verifier, share, blob, attempts, locked_until, updated) VALUES ($1,$2,$3,$4,$5,0,0,$6) ON CONFLICT (username) DO UPDATE SET salt=excluded.salt, verifier=excluded.verifier, share=excluded.share, blob=excluded.blob, attempts=0, locked_until=0, updated=excluded.updated',

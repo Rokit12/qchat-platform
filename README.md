@@ -17,7 +17,8 @@ A WhatsApp‑style messenger where people find each other **only by username**. 
   - Safety numbers and "verified" contacts, with warnings when a contact's key changes.
   - Alerts when a new device is linked to your account.
   - Encrypted local database, with an optional **passcode lock** (Argon2id) and auto‑lock.
-  - **Encrypted backups** you can export and import.
+  - **Log out without losing anything:** chats stay on the device (locked) and in an automatic **end‑to‑end encrypted backup** on the server, so they come back when you log in again — on the same device or a new one. Only *Delete account* erases them.
+  - **Encrypted backups** you can also export and import yourself.
 - **PIN login:** log in on any device with your username and a 6‑digit PIN you set at sign‑up. Your recovery key is only needed if you forget your PIN.
 - **Admin dashboard** (`/admin`, sign‑in with email + password + authenticator app):
   - Every user with their activity timeline.

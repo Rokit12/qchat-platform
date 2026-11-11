@@ -379,3 +379,4 @@ a.btn { text-decoration: none; display: inline-block; }
 a.btn { text-decoration: none; display: inline-block; }
 .donate-link { color: var(--accent); font-size: 13px; text-decoration: none; margin: 12px 0 0 14px; display: inline-block; }
 .donate-link:hover { text-decoration: underline; }
+.ob-welcome { background: rgba(255,176,32,.09); border-left: 3px solid var(--accent); padding: 10px 12px; border-radius: 8px; line-height: 1.45; }

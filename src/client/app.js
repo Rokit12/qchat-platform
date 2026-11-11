@@ -29,7 +29,7 @@ const isBig = (chat) => chat?.type === 'group' && chat.members.length > BIG_GROU
 
 // ======================= persistence =======================
 const dirty = new Set(); let saveT;
-function persist(key) { dirty.add(key); clearTimeout(saveT); saveT = setTimeout(flushPersist, 250); }
+function persist(key) { dirty.add(key); clearTimeout(saveT); saveT = setTimeout(flushPersist, 250); if (key !== 'settings') scheduleCloudBackup(); }
 async function flushPersist() {
   const keys = [...dirty]; dirty.clear();
   for (const k of keys) {
@@ -1001,7 +1001,8 @@ function settingsDialog() {
     <div class="row"><button class="btn" id="sShowKey">Show recovery key</button></div>
     <div class="field"><span>Security activity</span><ul class="list sec-list">${(A.secAlerts || []).slice(0, 8).map((a) => `<li><span class="fi">🛡️</span><div class="grow">${esc(a.text)}<small>${fmtAgo(a.ts)}</small></div></li>`).join('') || '<li class="muted">No suspicious activity detected.</li>'}</ul></div>
     <div class="section-title">Backup</div>
-    <p class="muted small">Encrypted with your recovery key — only you can restore it.</p>
+    <div class="switch"><span>Automatic encrypted backup<small class="muted block">Your chats are backed up to the server end-to-end encrypted with your account key — only you can open them. They come back when you log in on a new device. ${A.settings.cloudBackupAt ? 'Last backup ' + fmtAgo(A.settings.cloudBackupAt) + '.' : 'Not backed up yet.'}</small></span><span class="row"><button class="btn" id="sBackupNow">Back up now</button><input type="checkbox" id="sCloud" ${A.settings.cloudBackup === false ? '' : 'checked'}/></span></div>
+    <p class="muted small">Or keep your own copy, encrypted with your recovery key:</p>
     <div class="row"><button class="btn" id="sExport">Export encrypted backup</button><label class="btn">Import backup<input type="file" id="sImport" accept=".qcb" hidden/></label></div>
     <div class="section-title">Account</div>
     <div class="row"><button class="btn danger" id="sLogout">Log out of this device</button><button class="btn danger" id="sDelete">Delete account</button></div>
@@ -1029,9 +1030,15 @@ function settingsDialog() {
       openModal(`<h3>Recovery key</h3><p class="muted">Use with your username to log in on a new device or restore a backup.</p><pre class="keybox">${esc(core.recoveryKey())}</pre><div class="modal-actions"><button class="btn primary" data-close>Done</button></div>`);
     };
     $('#sExport', card).onclick = exportBackup;
+    $('#sBackupNow', card).onclick = async (e) => { e.target.disabled = true; e.target.textContent = 'Backing up…'; const ok = await uploadCloudBackup().catch(() => false); e.target.disabled = false; e.target.textContent = 'Back up now'; toast(ok ? 'Backed up ✅ (end-to-end encrypted)' : 'Backup failed — check your connection'); };
+    $('#sCloud', card).onchange = async (e) => {
+      A.settings.cloudBackup = e.target.checked; persist('settings');
+      if (!e.target.checked) { if (await confirmDialog('Delete your server backup?', 'Turning this off also deletes the encrypted copy on the server. If you then lose this device without another one linked, your chats can’t be recovered.', 'Turn off & delete', true)) core.wsSend({ t: 'backup_delete' }); else { A.settings.cloudBackup = true; e.target.checked = true; persist('settings'); } }
+      else scheduleCloudBackup(1000);
+    };
     $('#sImport', card).onchange = (e) => { const f = e.target.files[0]; if (f) importBackup(f); };
-    $('#sLogout', card).onclick = async () => { if (await confirmDialog('Log out?', 'Messages on this device will be erased. Make sure you saved your recovery key (and a backup if you want your history).', 'Log out', true)) { await core.removeDevice(DEV()).catch(() => {}); await wipeAndReload(); } };
-    $('#sDelete', card).onclick = async () => { if (prompt(`Type ${ME()} to permanently delete your account and free the username.`) !== ME()) return; core.wsSend({ t: 'delete_account' }); await wipeAndReload(); };
+    $('#sLogout', card).onclick = async () => { if (await confirmDialog('Log out?', 'Your account, chats and media are kept. On this device they stay encrypted and locked until you log back in with your username + PIN (or recovery key). New messages wait for you.', 'Log out')) logOut(); };
+    $('#sDelete', card).onclick = async () => { if (prompt(`Deleting your account permanently erases your chats, your encrypted backup on the server and this device's data, and frees the username. Type ${ME()} to confirm.`) !== ME()) return; core.wsSend({ t: 'delete_account' }); await wipeAndReload(); };
     $('#sSave', card).onclick = async () => {
       core.wsSend({ t: 'profile', displayName: $('#sName', card).value, about: $('#sAbout', card).value, avatar: av, hideLastSeen: $('#sHide', card).checked });
       A.settings.readReceipts = $('#sRead', card).checked;
@@ -1153,6 +1160,57 @@ async function importBackup(file) {
     const snap = JSON.parse(C.td.decode(pt));
     const n = await mergeSnapshot(snap); closeModal(); toast(`Backup restored — ${n} messages added`);
   } catch { toast('This backup belongs to a different account (or is damaged)'); }
+}
+
+// ---------- automatic end-to-end encrypted backup on the server ----------
+// The same snapshot as an exported backup, encrypted with the account's backup key (from the recovery key seeds).
+// The server stores ciphertext only. It comes back when you log in on a new device or after clearing the browser.
+const CLOUD_MAX = 18e6; let cloudT = null, cloudLast = 0, cloudBusy = false;
+const cloudAad = () => C.te.encode('qchat-cloud-v1|' + ME());
+function scheduleCloudBackup(delay = 20000) {
+  if (!K.id || A.settings.cloudBackup === false) return;
+  const memOnly = db.isMemoryOnly(); // nothing survives a reload here, so back up sooner
+  if (memOnly) delay = Math.min(delay, 3000);
+  clearTimeout(cloudT); cloudT = setTimeout(() => uploadCloudBackup().catch((e) => console.warn('backup', e)), Math.max(delay, cloudLast + (memOnly ? 15000 : 60000) - Date.now()));
+}
+async function uploadCloudBackup() {
+  if (!K.id || cloudBusy || A.settings.cloudBackup === false) return false;
+  cloudBusy = true;
+  try {
+    await flushPersist();
+    const snap = await snapshot({ withMedia: true, maxMedia: 2e6 });
+    let body = JSON.stringify({ v: 1, user: ME(), at: Date.now(), ...snap });
+    if (body.length > CLOUD_MAX) { // too big: drop the largest media until it fits (messages always come first)
+      const ids = Object.keys(snap.media).sort((a, b) => snap.media[b].length - snap.media[a].length);
+      while (body.length > CLOUD_MAX && ids.length) { delete snap.media[ids.shift()]; body = JSON.stringify({ v: 1, user: ME(), at: Date.now(), ...snap }); }
+    }
+    const { iv, ct } = await C.aesEncrypt(K.keys.backupKey, C.te.encode(body), cloudAad());
+    const r = await core.rpc({ t: 'backup_put', iv: C.b64(iv), ct: C.b64(ct) }, 'backup_ok', 60000);
+    cloudLast = Date.now();
+    if (r?.ok) { A.settings.cloudBackupAt = r.at || Date.now(); persist('settings'); return true; }
+    return false;
+  } finally { cloudBusy = false; }
+}
+async function restoreCloudBackup() {
+  const r = await core.rpc({ t: 'backup_get' }, 'backup', 60000);
+  if (!r || r.none || !r.ct) return 0;
+  try {
+    const pt = await C.aesDecrypt(K.keys.backupKey, C.unb64(r.iv), C.unb64(r.ct), cloudAad());
+    const n = await mergeSnapshot(JSON.parse(C.td.decode(pt)));
+    if (n) toast(`Restored ${n} messages from your encrypted backup ✅`, 5000);
+    return n;
+  } catch (e) { console.warn('backup restore failed', e); return 0; }
+}
+
+// ---------- log out: keep everything, locked ----------
+async function logOut() {
+  toast('Saving your chats…', 4000);
+  clearTimeout(cloudT);
+  await uploadCloudBackup().catch(() => false); // latest copy on the server too
+  await flushPersist();
+  core.disconnect();
+  await db.signOut(K.keys.backupKey, ME());
+  location.hash = ''; location.reload();
 }
 
 // ======================= status (24-hour stories) =======================
@@ -1504,6 +1562,7 @@ $('#createForm').onsubmit = async (e) => {
   e.preventDefault(); $('#obError').textContent = '';
   const f = e.target; const user = f.username.value.trim().toLowerCase().replace(/^@/, '');
   if (!/^[a-z0-9_.]{3,24}$/.test(user)) return ($('#obError').textContent = 'Username must be 3–24 characters: a-z, 0-9, _ or .');
+  if (!(await releaseSignedOut(user))) return;
   setObBusy(true); $('#obError').textContent = 'Generating post-quantum keys…';
   await new Promise((r) => setTimeout(r, 30));
   const seeds = C.newAccountSeeds();
@@ -1520,6 +1579,35 @@ $('#toggleKeyLogin').onclick = () => {
   $('#toggleKeyLogin').textContent = useKey ? 'Remember your PIN? Log in with it instead' : 'Forgot your PIN? Recover your account with your recovery key';
   $('#obError').textContent = '';
 };
+// ---------- signed out: the account's data is still here, locked ----------
+let signedOut = null; // username whose (locked) data is on this device
+function showSignedOut(user) {
+  signedOut = user; show('#onboard');
+  $$('.tab').find((t) => t.dataset.tab === 'restore')?.click();
+  $('#restoreForm [name=username]').value = user;
+  $('#obWelcome').classList.remove('hidden');
+  $('#obWelcome').innerHTML = `👋 Welcome back, <b>@${esc(user)}</b>. Your chats are saved on this device (encrypted) — log in to open them.`;
+  setTimeout(() => $('#restoreForm [name=pin]').focus(), 50);
+}
+/** Before creating or logging into a different account on a device that holds a signed-out account's data. */
+async function releaseSignedOut(user) {
+  if (!signedOut || signedOut === user) return true;
+  const ok = await confirmDialog(`Remove @${signedOut} from this device?`, `This device still holds @${signedOut}'s chats (encrypted). Continuing removes them from this device only — the account and its encrypted server backup are kept, and @${signedOut} can log back in anytime.`, 'Continue', true);
+  if (!ok) return false;
+  await db.wipe(); await db.openDb(); signedOut = null; $('#obWelcome').classList.add('hidden');
+  return true;
+}
+/** Logging back in to the account whose data is on this device: unlock it, no new device needed. */
+async function resumeSignedOut(user, seeds) {
+  const keys = C.accountKeys(seeds);
+  if (!(await db.signIn(keys.backupKey, user))) return false;
+  const id = await db.get('identity');
+  if (!id || id.user !== user || id.aikSeed !== C.b64(seeds.aikSeed)) { await db.wipe(); await db.openDb(); signedOut = null; return false; }
+  signedOut = null; $('#obWelcome').classList.add('hidden'); $('#obError').textContent = '';
+  await startApp(); toast('Welcome back! Your chats are right where you left them.', 4000);
+  return true;
+}
+
 $('#restoreForm').onsubmit = async (e) => {
   e.preventDefault(); $('#obError').textContent = '';
   const f = e.target; const user = f.username.value.trim().toLowerCase().replace(/^@/, '');
@@ -1534,12 +1622,19 @@ $('#restoreForm').onsubmit = async (e) => {
     try { seeds = await core.pinRecover(user, pin, (t) => ($('#obError').textContent = t)); }
     catch (err) { setObBusy(false); f.pin.value = ''; $('#obError').textContent = err.message; if (err.info?.wiped) $('#toggleKeyLogin').click(); return; }
   }
+  if (signedOut === user) { // same account as the data on this device → just unlock it
+    setObBusy(true); $('#obError').textContent = 'Unlocking your chats…';
+    if (await resumeSignedOut(user, seeds)) return setObBusy(false);
+  }
+  setObBusy(false);
+  if (!(await releaseSignedOut(user))) return;
   setObBusy(true); $('#obError').textContent = useKey ? 'Verifying recovery key…' : 'PIN correct — linking this device…';
   const ok = await beginEnroll(core.newIdentity(user, seeds), { register: false, confirmReplace: () => confirmDialog('Too many devices', 'You already have 5 linked devices. Logging in here will remove your oldest device.', 'Continue', true) });
   if (!ok) return;
-  const finish = () => {
-    core.sendPayload([], { type: 'sync_req', name: K.id.dev.name }); // ask my other devices for history
-    toast('Logged in. If another of your devices is online, approve the history copy there.', 6000);
+  const finish = async () => {
+    const n = await restoreCloudBackup().catch(() => 0); // chats from the encrypted server backup
+    core.sendPayload([], { type: 'sync_req', name: K.id.dev.name }); // + anything newer from my other devices
+    if (!n) toast('Logged in. If another of your devices is online, approve the history copy there.', 6000);
   };
   if (useKey) { // account recovered with the recovery key (PIN forgotten) → choose a new PIN first
     setObBusy(false); $('#obError').textContent = '';
@@ -1610,7 +1705,7 @@ $('#lockForm').onsubmit = async (e) => {
   if (!ok) { $('#lockErr').textContent = 'Wrong passcode'; $('#lockInput').select(); return; }
   $('#lockErr').textContent = ''; $('#lockInput').value = ''; await startApp();
 };
-$('#lockForget').onclick = async () => { if (await confirmDialog('Reset this device?', 'All local data will be erased. Log back in with your username + recovery key, then restore a backup or copy history from another device.', 'Erase & reset', true)) wipeAndReload(); };
+$('#lockForget').onclick = async () => { if (await confirmDialog('Reset this device?', 'All data on this device will be erased. Your account is kept: log back in with your username + PIN (or recovery key) and your chats come back from your encrypted backup.', 'Erase & reset', true)) wipeAndReload(); };
 
 // live service status on the home screen
 async function loadServiceStatus() {
@@ -1632,6 +1727,7 @@ window.addEventListener('beforeunload', () => { flushPersist(); });
   const state = await db.keyState();
   if (state === 'locked') { show('#lockScreen'); setTimeout(() => $('#lockInput').focus(), 50); return; }
   if (state === 'new') return show('#onboard');
+  if (state === 'signedout') return showSignedOut(await db.signedOutUser());
   await startApp();
 })();
 // Diagnostics (used by the automated tests; harmless in production)
