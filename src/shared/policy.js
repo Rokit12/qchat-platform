@@ -3,7 +3,7 @@ export const RESERVED_USERNAMES = new Set([
   'admin', 'administrator', 'root', 'system', 'support', 'help', 'helpdesk', 'security', 'official', 'qchat', 'qchat_support',
   'qchatsupport', 'qchat.support', 'qchat_official', 'staff', 'team', 'moderator', 'mod', 'abuse', 'postmaster', 'webmaster',
   'noreply', 'no_reply', 'verify', 'verification', 'billing', 'payments', 'account', 'accounts', 'service', 'customer_service',
-  'trust', 'safety', 'legal', 'privacy', 'ceo', 'owner', 'anthropic', 'claude',
+  'trust', 'safety', 'legal', 'privacy', 'ceo', 'owner',
 ]);
 // names that try to look official
 const IMPERSONATION = /(q\s*chat|official|support\s*team|customer\s*(care|service)|security\s*team|verified|admin(istrator)?|moderator|staff|help\s*desk|[✓✔☑])/i;

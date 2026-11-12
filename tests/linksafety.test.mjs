@@ -10,7 +10,7 @@ test('phishing links are flagged as dangerous', () => {
     assert.equal(lvl(u), 'danger', u);
 });
 test('official sites are not flagged as phishing', () => {
-  for (const u of ['https://www.paypal.com/signin', 'https://accounts.google.com/', 'https://appleid.apple.com/', 'https://www.safaricom.co.ke/mpesa', 'https://github.com/anthropics', 'https://en.wikipedia.org/wiki/Post-quantum_cryptography'])
+  for (const u of ['https://www.paypal.com/signin', 'https://accounts.google.com/', 'https://appleid.apple.com/', 'https://www.safaricom.co.ke/mpesa', 'https://github.com/Rokit12/Q-chat-', 'https://en.wikipedia.org/wiki/Post-quantum_cryptography'])
     assert.notEqual(lvl(u), 'danger', u);
   assert.equal(lvl('https://en.wikipedia.org/wiki/Lagos'), 'ok');
 });
